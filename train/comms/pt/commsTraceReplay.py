@@ -349,6 +349,15 @@ class commsTraceReplayBench(paramCommsBench):
                 if len(self.collectiveArgs.opTensor_split) > 0
                 else curOutNumElem
             )
+
+            if curComm["comms"] == "all_to_allv":
+                ip_split_len = len(curComm["in_split"])
+                op_split_len = len(curComm["out_split"])
+                if ((ip_split_len > 0) and (op_split_len == 0)):
+                    curOutNumElem = (curOutNumElem // ip_split_len) * self.collectiveArgs.world_size
+                if ((ip_split_len == 0) and (op_split_len > 0)):
+                    curInNumElem = (curInNumElem // op_split_len) * self.collectiveArgs.world_size
+
             logger.debug(
                 f"shrink message sizes to curInNumElem {curInNumElem}, curOutNumElem {curOutNumElem}"
             )
@@ -489,15 +498,14 @@ class commsTraceReplayBench(paramCommsBench):
                     pass
 
                 # calculating batch latency (batch defined by --colls-per-batch)
-                if collName == "wait":
-                    if self.colls_per_batch > 0:
-                        coll_in_batch_num += 1
-                        if coll_in_batch_num == self.colls_per_batch:
-                            batch_end = time.monotonic()
-                            batch_latency = (batch_end - batch_begin) * 1e3 # make it millisecond
-                            coll_in_batch_num = 0
-                            batch_num += 1
-                            self.batchLat.append(batch_latency)
+                if collName == "wait" and self.colls_per_batch > 0:
+                    coll_in_batch_num += 1
+                    if coll_in_batch_num == self.colls_per_batch:
+                        batch_end = time.monotonic()
+                        batch_latency = (batch_end - batch_begin) * 1e3 # make it millisecond
+                        coll_in_batch_num = 0
+                        batch_num += 1
+                        self.batchLat.append(batch_latency)
 
                 if self.is_blocking:
                     self.backendFuncs.complete_accel_ops(self.collectiveArgs)
@@ -518,6 +526,7 @@ class commsTraceReplayBench(paramCommsBench):
 
             curComm["seqnum"] = cnt
             curComm["latency_us"] = latency
+            curComm["global_latency_us"] = global_latency
             curComm["quant_us"] = self.collectiveArgs.quant_time.getTimeUS()
             curComm["dequant_us"] = self.collectiveArgs.dequant_time.getTimeUS()
             self.totalCommsLatency += latency
@@ -534,6 +543,7 @@ class commsTraceReplayBench(paramCommsBench):
                         "blocked": "Y" if (self.is_blocking) else "N",
                         "in_msg_size_bytes": curComm["in_msg_size"] * elem_size if "in_msg_size" in curComm else 0,
                         "out_msg_size_bytes": curComm["out_msg_size"] * elem_size if "out_msg_size" in curComm else 0,
+                        "global_latency_us": global_latency,
                         "latency_us": latency,
                         "quant_us": self.collectiveArgs.quant_time.getTimeUS(),
                         "dequan_us": self.collectiveArgs.dequant_time.getTimeUS(),
@@ -557,6 +567,9 @@ class commsTraceReplayBench(paramCommsBench):
                 4) report stats and performance (if not dry-run)
         """
         logger.info(f"[Rank-{comms_world_info.global_rank}] reading trace from {self.trace_file}")
+        self.comm_size = comms_world_info.world_size
+        self.global_rank = comms_world_info.global_rank
+
         self.readTrace(remotePath=self.trace_file)
 
         self.initTraceStat()
@@ -677,9 +690,17 @@ class commsTraceReplayBench(paramCommsBench):
 
             self.comms_trace = json.load(raw_comms_trace)
         else:
-            # read the json file
+            # read the json file from local disk
             with open(self.trace_file) as f:
                 self.comms_trace = json.load(f)
+
+        # additional check the trace format and convert it if needed
+        try:
+            from internals import fbTraceParser
+        except ImportError:
+            logger.warning("Cannot parse FB trace...skip...")
+        else:
+            self.comms_trace = fbTraceParser(self.comms_trace, target_rank=self.global_rank)
 
 def main():
 
