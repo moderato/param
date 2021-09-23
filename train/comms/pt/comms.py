@@ -663,11 +663,11 @@ class commsCollBench(paramCommsBench):
 
         if self.collectiveArgs.pair == 0:
             print(
-                "\n\tCOMMS-RES\tsize (B)\t num-elements\t Latency(us):p50\tp75\t\tp95\t algBW(GB/s)\t busBW(GB/s)"
+                "\n\tCOMMS-RES\t size (B)\t num-elements\t Latency(us)\t p50\t\t p75\t\t p95\t\t algBW(GB/s)\t busBW(GB/s)"
             )
         else:
             print(
-                "\n\tCOMMS-RES\ttotal-pair-size (B)\t num-elements\t num-elements-pair\t Latency(us):p50\tp75\t\tp95\t algBW(GB/s)\t busBW(GB/s)"
+                "\n\tCOMMS-RES\t total-pair-size (B)\t num-elements\t num-elements-pair\t Latency(us)\t p50\t\t p75\t\t p95\t\t algBW(GB/s)\t busBW(GB/s)"
             )
         for idx, curSize in enumerate(allSizes):
             if commsParams.backend == "xla":
