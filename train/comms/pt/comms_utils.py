@@ -431,6 +431,28 @@ class commsParamsHolderBase:
 
         self.num_pgs = 1
 
+class dlrmParamsHolder(commsParamsHolderBase):
+    def __init__(self, args, mpi_env_params, benchTime):
+        # A holding object for the input parameters from collective benchmark
+        super().__init__(args)
+        
+        self.numDevices = mpi_env_params['world_size']
+        self.numBatches = args.num_batches + args.warmup_batches  # NOTE: Should ensure that dataSize = int(N) * numDevices * batchSize
+        self.numBatchesPerEpoch = args.mini_batch_size
+        self.dataSize = mpi_env_params['world_size'] * self.numBatches * self.numBatchesPerEpoch
+        self.embedLayers = []  # scaledEmbedLayers
+        self.mini_batch_size = args.mini_batch_size
+        self.arch_sparse_feature_size = args.arch_sparse_feature_size
+        self.mpi_env_params = mpi_env_params
+        self.collective = 'all_reduce'  # dummy params for now
+        self.warmup_batches = args.warmup_batches
+
+        self.benchTime = benchTime
+
+    def __str__(self):
+        d = self.__dict__
+        del d['benchTime'] # Don't need to print this object
+        return str(d)
 
 class commsParamsHolder(commsParamsHolderBase):
     def __init__(self, args, comms_world_info, element_size, benchTime):

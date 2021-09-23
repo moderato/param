@@ -24,7 +24,7 @@ import logging
 import dlrm_data as dd
 from pytorch_dist_backend import PyTorchDistBackend
 import comms_utils
-from comms_utils import paramCommsBench
+from comms_utils import paramCommsBench, dlrmParamsHolder
 
 logger = logging.getLogger(__name__)
 
@@ -553,7 +553,7 @@ class commsDLRMBench(paramCommsBench):
         super().__init__(supportedNwstacks=["pytorch-dist"])
         self.model = ""
         self.mixedDimFlag = False
-        self.expt_config = {}
+        self.expt_config = None # Use dlrmParamsHolder later
         self.measured_regions = {}
         self.commDetails = []
         self.paramNN = paramDLRM_Net()
@@ -860,7 +860,7 @@ class commsDLRMBench(paramCommsBench):
             timeElapsedTensor = torch.tensor(combined_latency_list, device=curDevice)
             tensor_list = [torch.ones_like(timeElapsedTensor) for _ in range(world_size)]
             self.collectiveArgs.ipTensor = timeElapsedTensor
-            self.collectiveArgs.tensorList = tensor_list
+            self.collectiveArgs.opTensor = tensor_list
             self.collectiveArgs.asyncOp = False
             self.collectiveArgs.dataSize = (
                 timeElapsedTensor.nelement() * timeElapsedTensor.element_size()
@@ -872,7 +872,7 @@ class commsDLRMBench(paramCommsBench):
             memory_tensor = torch.tensor(combined_memory_list, device=curDevice)
             memory_tensor_list = [torch.ones_like(memory_tensor) for _ in range(world_size)]
             self.collectiveArgs.ipTensor = memory_tensor
-            self.collectiveArgs.tensorList = memory_tensor_list
+            self.collectiveArgs.opTensor = memory_tensor_list
             self.backendFuncs.all_gather(self.collectiveArgs)
             self.backendFuncs.complete_accel_ops(self.collectiveArgs)
 
@@ -953,7 +953,7 @@ class commsDLRMBench(paramCommsBench):
             timers['iter_start'] = time.monotonic()
 
             curIterSparseFeatures = SparseFeatures(mConfig.num_sparse_fea,
-                                                    self.expt_config['mini_batch_size'],
+                                                    self.expt_config.mini_batch_size,
                                                     lS_o,
                                                     lS_i,
                                                     curDevice, global_rank,
@@ -1040,13 +1040,13 @@ class commsDLRMBench(paramCommsBench):
             self.measured_regions['bwd_top_ar']['memory'].append(sum(memSizes['top']))
             self.measured_regions['bwd_bot_ar']['memory'].append(sum(memSizes['bot']))
 
-            if(batchNum >= self.expt_config['warmup_batches']):
+            if(batchNum >= self.expt_config.warmup_batches):
                 self.computeTimes(timers)
             self.intermed_region_memory(timers)
 
     def runBench(self, mpi_env_params, comms_world_info, args):
         """ Run num-batches iterations of the model (only comms-operations) """
-        if(self.expt_config['nw_stack'] == "pytorch-dist"):
+        if(self.expt_config.nw_stack == "pytorch-dist"):
             # WARNING: expt_config is different from commsParams but using it as a placeholder here!
             # FIXME: can we make it common
             self.backendFuncs = PyTorchDistBackend(comms_world_info, self.expt_config)
@@ -1088,32 +1088,20 @@ class commsDLRMBench(paramCommsBench):
             with open(comms_file, "w") as write_file:
                 json.dump(self.commDetails, write_file)
 
-        measuredIters = self.expt_config['numBatches'] - self.expt_config['warmup_batches']
-        self.reportBenchTime(global_rank, self.expt_config['warmup_batches'], measuredIters, world_size, curDevice)
+        measuredIters = self.expt_config.numBatches - self.expt_config.warmup_batches
+        self.reportBenchTime(global_rank, self.expt_config.warmup_batches, measuredIters, world_size, curDevice)
 
     def setBench(self, args, mpi_env_params):
         args.embed_dtype = self.dtypeMap[args.embed_data_type]
         args.data_size = mpi_env_params['world_size'] * args.num_batches * args.mini_batch_size
+        args.device = "cuda"
         if(mpi_env_params['global_rank'] == 0):
             print("\t mpi-params: %s" % (mpi_env_params))
 
         self.model = args.model
         print("\t rank: %s args.model: %s model: %s " % (mpi_env_params['global_rank'], args.model, self.model))
 
-        # Once layer-dimensions are inferred, we can use the rest of the code (I think!)
-        self.expt_config['numDevices'] = mpi_env_params['world_size']
-        self.expt_config['numBatches'] = args.num_batches + args.warmup_batches  # NOTE: Should ensure that dataSize = int(N) * numDevices * batchSize
-        self.expt_config['numBatchesPerEpoch'] = args.mini_batch_size
-        self.expt_config['dataSize'] = mpi_env_params['world_size'] * self.expt_config['numBatches'] * self.expt_config['numBatchesPerEpoch']
-        self.expt_config['embedLayers'] = []  # scaledEmbedLayers
-        self.expt_config['mini_batch_size'] = args.mini_batch_size
-        self.expt_config['arch_sparse_feature_size'] = args.arch_sparse_feature_size
-        self.expt_config['mpi_env_params'] = mpi_env_params
-        self.expt_config['nw_stack'] = args.nw_stack
-        self.expt_config['collective'] = 'all_reduce'  # dummy params for now
-        self.expt_config['warmup_batches'] = args.warmup_batches
-        self.expt_config['device'] = "cuda"
-        self.expt_config['backend'] = args.backend
+        self.expt_config = dlrmParamsHolder(args, mpi_env_params, self.benchTime)
 
         if(mpi_env_params['global_rank'] == 0):
             print("\t expt_config: %s " % (self.expt_config))
