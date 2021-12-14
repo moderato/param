@@ -266,7 +266,7 @@ class modelConfig():
 
         self.topMLP = ipDict['topMLP']
         self.botMLP = ipDict['botMLP']
-        self.embedLayers = ipDict['embedLayers']
+        self.embeddingLayers = ipDict['embeddingLayers']
 
         self.train_ld = ipDict['train_ld']
 
@@ -277,12 +277,12 @@ class paramDLRM_Net(nn.Module):
         self.colDim = 1
         self.sparseFrac = 1.0  # PENDING: Should set it to a value which ensures we don't transfer the whole of the embedding table.
 
-    def initializeData(self, curDevice, backendFuncs, global_rank, topMLP, botMLP, embedLayersDim):
+    def initializeData(self, curDevice, backendFuncs, global_rank, topMLP, botMLP, embeddingLayersDim):
         # Generate data for each device.
         curProcData = {}
         topLayers = []
         botLayers = []
-        embedLayers = nn.ModuleList()  # embedLayers = []
+        embeddingLayers = nn.ModuleList()  # embeddingLayers = []
 
         for layerIdx, curLayer in enumerate(topMLP):
             curLayerData = backendFuncs.alloc_random([curLayer[self.rowDim], curLayer[self.colDim]], curDevice, torch.float)
@@ -297,15 +297,15 @@ class paramDLRM_Net(nn.Module):
             botLayers.append(curLayerData)
 
         host = os.uname()[1]
-        for layerIdx, curLayer in enumerate(embedLayersDim):
+        for layerIdx, curLayer in enumerate(embeddingLayersDim):
             curLayerData = backendFuncs.alloc_embedding_tables(curLayer[self.rowDim], curLayer[self.colDim], curDevice, torch.float)
-            if(layerIdx == 0):
-                print("\t Embed-Layer-%d host: %s data: %s n: %d m: %d " % (layerIdx, host, curLayerData.weight.data[0][0], curLayer[self.rowDim], curLayer[self.colDim]))
-            embedLayers.append(curLayerData)
+            if(global_rank == 0):
+                print("\t Embedding-Layer-%d host: %s data: %s n: %d m: %d " % (layerIdx, host, curLayerData.weight.data[0][0], curLayer[self.rowDim], curLayer[self.colDim]))
+            embeddingLayers.append(curLayerData)
 
         curProcData['topLayers'] = topLayers
         curProcData['botLayers'] = botLayers
-        curProcData['embedLayers'] = embedLayers
+        curProcData['embeddingLayers'] = embeddingLayers
         return curProcData
 
     def apply_emb(self, lS_o, lS_i, emb_l, mixed_dim=False):
@@ -535,8 +535,8 @@ class paramDLRM_Net(nn.Module):
         ipConfig['botMLP'] = botMLP
 
         print("\t rank: %d len(local_emb_slice): %s local_emb_dims: %s " % (global_rank, len(ipConfig['local_emb_slice']), len(local_emb_dims)))
-        embedLayers = self.create_emb(global_rank, ipConfig['local_emb_dims'], ipConfig['local_emb_slice'])  # WARNING: Assuming that for allocating memory, we should only use local-emb-slice.
-        ipConfig['embedLayers'] = embedLayers
+        embeddingLayers = self.create_emb(global_rank, ipConfig['local_emb_dims'], ipConfig['local_emb_slice'])  # WARNING: Assuming that for allocating memory, we should only use local-emb-slice.
+        ipConfig['embeddingLayers'] = embeddingLayers
 
         args.numpy_rand_seed = global_rank
         train_data, train_ld = dd.data_loader(args, ln_emb, m_den)
@@ -887,6 +887,8 @@ class commsDLRMBench(paramCommsBench):
 
                 res_mean_percentiles = []
                 res_percentiles = []
+                # q-th percentile (used here): q% of the samples are LOWER than this value
+                # percent exceedance: q% of the samples are HIGHER than this value
                 print("\t{}\t{:>36}\t{:>12}\t{:>12}\t{:>12}\t{:>12}\t{:>12}\t{:>12}".format("iters","region","memory (B)","Latency(us):min","p50","p75","p95","sum(p50)"))
                 for region_idx, cur_region in enumerate(all_timers):
                     # For each region, get data from different ranks. Compute percentiles for a given region.
@@ -965,7 +967,7 @@ class commsDLRMBench(paramCommsBench):
             # Begin with reading the embedding table.
             self.backendFuncs.complete_accel_ops(self.collectiveArgs, initOp=True)
             timers['bef_emb_lookup'] = time.monotonic()
-            ly = self.paramNN.apply_emb(g_offsets, g_indices, curDeviceData['embedLayers'], mixed_dim=self.mixedDimFlag)
+            ly = self.paramNN.apply_emb(g_offsets, g_indices, curDeviceData['embeddingLayers'], mixed_dim=self.mixedDimFlag)
 
             # Start with fwd pass all-to-all, this is blocking communication.
             a2a_req = ""
@@ -985,7 +987,7 @@ class commsDLRMBench(paramCommsBench):
                 self.backendFuncs.complete_accel_ops(self.collectiveArgs, initOp=True)
                 self.backendFuncs.barrier(self.collectiveArgs)
 
-            #back-prop: top layer, non-blocking between the top-layers.
+            # back-prop: top layer, non-blocking between the top-layers.
             timers['bwd_top_ar_start'] = time.monotonic()
             for curLayerIdx in range(len(curDeviceData['topLayers'])):
                 # Prepare collective arguments
@@ -1021,7 +1023,7 @@ class commsDLRMBench(paramCommsBench):
                 self.backendFuncs.complete_accel_ops(self.collectiveArgs, initOp=True)
                 self.backendFuncs.barrier(self.collectiveArgs)
 
-            #back-prop: bottom layer, non-blocking between the layers.
+            # back-prop: bottom layer, non-blocking between the layers.
             timers['bwd_bot_ar_start'] = time.monotonic()
             for curLayerIdx in range(len(curDeviceData['botLayers'])):
                 self.collectiveArgs.ipTensor = curDeviceData['botLayers'][curLayerIdx]
@@ -1044,15 +1046,18 @@ class commsDLRMBench(paramCommsBench):
                 self.computeTimes(timers)
             self.intermed_region_memory(timers)
 
+
+            print(global_rank, timers['bwd_bot_ar_end'] - timers['iter_start'])
+
     def runBench(self, mpi_env_params, comms_world_info, args):
         """ Run num-batches iterations of the model (only comms-operations) """
         if(self.expt_config.nw_stack == "pytorch-dist"):
             # WARNING: expt_config is different from commsParams but using it as a placeholder here!
             # FIXME: can we make it common
             self.backendFuncs = PyTorchDistBackend(comms_world_info, self.expt_config)
-            self.backendFuncs.initialize_backend(comms_world_info.master_ip, comms_world_info.master_port, backend=self.expt_config['backend'])
+            self.backendFuncs.initialize_backend(comms_world_info.master_ip, comms_world_info.master_port, backend=self.expt_config.backend)
         else:
-            logger.error("\t Input nw_stack {} or backend {} not supported! ".format(self.expt_config['nw_stack'], self.expt_config['backend']))
+            logger.error("\t Input nw_stack {} or backend {} not supported! ".format(self.expt_config.nw_stack, self.expt_config.backend))
             sys.exit()
 
         local_rank, global_rank, world_size, group, curDevice, curHwDevice = comms_utils.get_rank_details(self.backendFuncs)
@@ -1065,7 +1070,7 @@ class commsDLRMBench(paramCommsBench):
         self.my_rank = global_rank
 
         # Initializes the data for MLP, local embedding table
-        curDeviceData = self.paramNN.initializeData(curDevice, self.backendFuncs, global_rank, mConfig.topMLP, mConfig.botMLP, mConfig.embedLayers)
+        curDeviceData = self.paramNN.initializeData(curDevice, self.backendFuncs, global_rank, mConfig.topMLP, mConfig.botMLP, mConfig.embeddingLayers)
         host = os.uname()[1]
         timers = self.initTimers()
         self.collectiveArgs.timers = timers
