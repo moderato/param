@@ -359,15 +359,15 @@ class paramDLRM_Net(nn.Module):
         return mlp_layers
 
     def create_emb(self, global_rank, local_emb_dims, ln):
-        embed_layers = []
+        embedding_layers = []
         for i in range(0, ln.size):
             n = ln[i]
             m = local_emb_dims[i]
             if(global_rank == 0):
                 if(i % 50 == 0):
                     print("\t Embedding layer: %d size: %d x %d " % (i, n, m))
-            embed_layers.append([n, m])  # as per DLRM benchmark dlrm_s_pytroch.py
-        return embed_layers
+            embedding_layers.append([n, m])  # as per DLRM benchmark dlrm_s_pytroch.py
+        return embedding_layers
 
     def get_slice_sparse(self, global_rank, num_emb_per_rank, world_size):
         if global_rank == 0:
@@ -432,7 +432,7 @@ class paramDLRM_Net(nn.Module):
 
         return (offsets, all_feature_indices)
 
-    def getEmbTableDimensions(self, global_rank, world_size, args):
+    def getEmbeddingTableDimensions(self, global_rank, world_size, args):
         local_emb_dims = []
         ln_emb = ""
         ipConfig = {}
@@ -485,7 +485,7 @@ class paramDLRM_Net(nn.Module):
         ### parse command line arguments ###
         (local_emb_dims,
             ln_emb,
-            ipConfig) = self.getEmbTableDimensions(global_rank, world_size, args)
+            ipConfig) = self.getEmbeddingTableDimensions(global_rank, world_size, args)
         if(global_rank == 0):
             print("\t ipConfig['num_sparse_fea']: %s " % (ipConfig['num_sparse_fea']))
             print("\t ipConfig['n_emb_per_rank']: %s " % (ipConfig['n_emb_per_rank']))
@@ -601,15 +601,15 @@ class commsDLRMBench(paramCommsBench):
         parser.add_argument("--data-trace-enable-padding", type=bool, default=False)
         parser.add_argument("--numpy-rand-seed", type=int, default=123)
 
-        parser.add_argument("--embed-dtype", type=torch.dtype, default=torch.float32)  # will be overwritten based on args.data_type and dtypeMap.
-        parser.add_argument("--embed-data-type", type=str, default='float32',
+        parser.add_argument("--embedding-dtype", type=torch.dtype, default=torch.float32)  # will be overwritten based on args.data_type and dtypeMap.
+        parser.add_argument("--embedding-data-type", type=str, default='float32',
                             help="Data type to be used, supports " + str(self.supportedDtype))
 
         return parser.parse_args()
 
     def checkArgs(self, args):
         super().checkArgs(args)
-        if(args.embed_data_type not in self.supportedDtype):
+        if(args.embedding_data_type not in self.supportedDtype):
             print("\t ERROR: Specified dtype: %d is not one of the supported commstyle: %s" % (args.data_type, str(self.supportedDtype)))
             comms_utils.gracefulExit()
 
@@ -1097,7 +1097,7 @@ class commsDLRMBench(paramCommsBench):
         self.reportBenchTime(global_rank, self.expt_config.warmup_batches, measuredIters, world_size, curDevice)
 
     def setBench(self, args, mpi_env_params):
-        args.embed_dtype = self.dtypeMap[args.embed_data_type]
+        args.embedding_dtype = self.dtypeMap[args.embedding_data_type]
         args.data_size = mpi_env_params['world_size'] * args.num_batches * args.mini_batch_size
         args.device = "cuda"
         if(mpi_env_params['global_rank'] == 0):
