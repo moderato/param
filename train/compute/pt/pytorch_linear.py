@@ -15,14 +15,16 @@ class Net(nn.Module):
         super(Net, self).__init__()
         self.layer_num = layer_num
         self.linear_in = nn.Linear(input_size, hidden_size)
-        self.linear_hid = nn.Linear(hidden_size, hidden_size)
+        self.linear_hid_list = nn.ModuleList(
+            [nn.Linear(hidden_size, hidden_size) for _ in range(self.layer_num)]
+        )
         self.linear_out = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
         x = self.linear_in(x)
         x = F.relu(x)
-        for _ in range(self.layer_num):
-            x = self.linear_hid(x)
+        for linear_hid in self.linear_hid_list:
+            x = linear_hid(x)
             x = F.relu(x)
         x = self.linear_out(x)
         x = F.softmax(x, dim=1)
@@ -175,13 +177,6 @@ def run_single(args, layer_num, input_size, hidden_size, output_size, batch_size
     device = args.device
     optimizer_type = args.optimizer_type
     data_type = args.dtype
-    # num_batches = args.num_batches
-
-    dt = torch.float32
-    if data_type == "float16":
-        dt = torch.float16
-    if data_type == "bfloat16":
-        dt = torch.bfloat16
 
     torch.manual_seed(1)
 
@@ -234,7 +229,7 @@ def run_single(args, layer_num, input_size, hidden_size, output_size, batch_size
             assert 0, "Unsupported optimizer type"
 
     elap, loss = train(
-        model, dev, optimizer, dt, input_size, output_size, batch_size, args
+        model, dev, optimizer, data_type, input_size, output_size, batch_size, args
     )
     return elap, loss
 
@@ -289,7 +284,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Measure the performance of MLP")
     parser.add_argument("--device", required=True, choices=["cpu", "gpu", "tpu"])
     parser.add_argument(
-        "--optimizer-type", default="sgd", help="Optimizer: SGD", choices=["sgd", "lamb"]
+        "--optimizer-type",
+        default="sgd",
+        help="Optimizer: SGD",
+        choices=["sgd", "lamb"],
     )
     parser.add_argument(
         "--dtype",
@@ -303,12 +301,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=512, help="Batch size")
     parser.add_argument("--input-size", type=int, default=1024, help="Input layer size")
     parser.add_argument(
-        "--hidden-size", type=int, default=128, help="Number of hidden_sizes per layer"
+        "--hidden-size", type=int, default=1024, help="Number of hidden_sizes per layer"
     )
     parser.add_argument(
         "--output-size", type=int, default=1024, help="Output layer size"
     )
-    # parser.add_argument("--num-batches", type=int, default=100, help="Number of batches to train")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--warmups", type=int, default=10)
 
@@ -318,7 +315,6 @@ if __name__ == "__main__":
     input_size = args.input_size
     hidden_size = args.hidden_size
     output_size = args.output_size
-    # num_batches = args.num_batches
 
     d = [(layer_num, input_size, hidden_size, output_size, batch_size)]
     run(args, d)

@@ -27,6 +27,7 @@ supportedCollectives = [
     "all_gather",
     "broadcast",
     "reduce_scatter",
+    "reduce_scatter_base",
     "all_gather_base",
     "incast",
     "multicast",
@@ -211,23 +212,24 @@ class commsCollBench(paramCommsBench):
         args.dtype = self.dtypeMap[args.data_type]
 
         if args.b < 1:
-            logger.warn(
+            logger.warning(
                 f"Starting size (--b {args.b}) should be greater than 1 byte...fix and continue"
             )
             args.b = 1
 
         if args.e < args.b:
-            logger.warn(
+            logger.warning(
                 f"the begin-size (--b {args.b}) is larger than the end-size (--e {args.e})"
             )
 
         if args.device == "cpu" and args.backend == "nccl":
             raise ValueError(f"NCCL is not supported for device type {args.device}")
 
-        if args.c == 1 and args.z == 0:
-            logger.warn(
-                "Data validation may not be fully supported for non-blocking mode"
+        if args.c == 1 and args.z == 0 and args.collective in ("all_reduce", "reduce", "reduce_scatter"):
+            logger.warning(
+                f"Data validation is not supported for {args.collective} in non-blocking mode, disabled and continue"
             )
+            args.c = 0
 
         # run a few sanity checks
         if args.bitwidth < 32:
@@ -264,11 +266,11 @@ class commsCollBench(paramCommsBench):
                 elapsedTimeNS = 0.0
                 self.collectiveArgs.quant_time.reset()
                 self.collectiveArgs.dequant_time.reset()
+            # reset tensor values for data validation check
+            if enable_comms:
+                self.setTensorVal(self.collectiveArgs.opTensor)
             # for blocking mode, do barrier before starting collective
             if is_blocking:
-                # reset tensor values for data validation check
-                if enable_comms:
-                    self.setTensorVal(self.collectiveArgs.opTensor)
                 self.backendFuncs.sync_barrier(self.collectiveArgs)
 
             start = time.monotonic()  # available only in py3
@@ -806,6 +808,8 @@ class commsCollBench(paramCommsBench):
             )[0]
             dequantLatencyAcrossRanks = dequantLatencyAcrossRanks.cpu().detach().numpy()
         else:
+            if isinstance(tensorList, list):
+                tensorList = [t.cpu().detach().numpy() for t in tensorList]            
             latencyAcrossRanks = np.array(tensorList)
             # quant tensor
             quantLatencyAcrossRanks = np.array(quantTimeTensorList)
@@ -864,6 +868,8 @@ class commsCollBench(paramCommsBench):
             latencyAcrossRanks = torch.transpose(tensorList.view(-1, 1), 0, 1)[0]
             latencyAcrossRanks = latencyAcrossRanks.cpu().detach().numpy()
         else:
+            if isinstance(tensorList, list):
+                tensorList = [t.cpu().detach().numpy() for t in tensorList]            
             latencyAcrossRanks = np.array(tensorList)
 
         logger.debug(f"Latency across all ranks: {latencyAcrossRanks}")
@@ -1303,9 +1309,9 @@ def main():
 
     collBenchObj.checkArgs(args)
 
-    mpi_env_params = comms_utils.read_mpi_env_vars()
-    if mpi_env_params["global_rank"] == 0:
-        print("\t MPI environment: %s " % (str(mpi_env_params)))
+    comms_env_params = comms_utils.read_comms_env_vars()
+    if comms_env_params["global_rank"] == 0:
+        print("\t MPI environment: %s " % (str(comms_env_params)))
         print(
             "\t backend: %s nw-stack: %s mode: %s args.b: %d args.e: %d args.f: %d args.z: %s args.master_ip: %s "
             % (
@@ -1322,7 +1328,7 @@ def main():
 
     element_size = torch.ones([1], dtype=args.dtype).element_size()
     comms_world_info = comms_utils.comms_world_info_holder(
-        args.master_ip, args.master_port, args.num_tpu_cores, mpi_env_params
+        args.master_ip, args.master_port, args.num_tpu_cores, comms_env_params
     )
 
     commsParams = comms_utils.commsParamsHolder(
