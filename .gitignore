@@ -1,4 +1,7 @@
 train/comms/pt/execution_graphs
 train/comms/pt/traces
-train/comms/pt/*.txt
 train/comms/pt/__pycache__
+train/comms/pt/*.txt
+train/comms/pt/bench_results/*.txt
+train/comms/pt/*.png
+train/comms/pt/*.pdf

@@ -573,6 +573,7 @@ class commsParamsHolder(commsParamsHolderBase):
         self.src_ranks = parseRankList(args.src_ranks, "src_ranks", comms_world_info)
         self.dst_ranks = parseRankList(args.dst_ranks, "dst_ranks", comms_world_info)
         self.comms_world_info = comms_world_info
+        self.bench_params_file = args.bench_params_file
 
 
 class collectiveArgsHolder:

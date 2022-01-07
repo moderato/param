@@ -186,6 +186,12 @@ class commsCollBench(paramCommsBench):
             default=100,
             help="window size for pt2pt throughput test",
         )  # optional:  point to point throughput test window size
+        parser.add_argument(
+            "--bench-params-file",
+            type=str,
+            default=None,
+            help="the file of benchmark params"
+        )  # the file of benchmark params
 
         return parser.parse_known_args()
 
@@ -270,7 +276,8 @@ class commsCollBench(paramCommsBench):
             comm_fn(self.collectiveArgs)
             # post another collecitve if on comms pair mode, otherwise it's noop
             self.collectiveArgs.group = self.backendFuncs.get_next_group()
-            comm_fn_pair(self.collectiveArgs, pair=enable_comms_pair)
+            if enable_comms_pair:
+                comm_fn_pair(self.collectiveArgs, pair=enable_comms_pair)
 
             if enable_compute:
                 for _ in range(self.collectiveArgs.numComputePerColl):
@@ -831,6 +838,8 @@ class commsCollBench(paramCommsBench):
         quantTimeTensorList,
         dequantTimeTensorList,
     ):
+        if commsParams.bench_params_file is None:
+            return
         # convernt num_elements to # of elements per rank
         if commsParams.collective in ("all_to_all", "all_to_allv"):
             results["numElements"] = int(
@@ -1140,6 +1149,125 @@ class commsCollBench(paramCommsBench):
         # wait rank 0 reports results to avoid other ranks mess up the output
         self.backendFuncs.sync_barrier(self.collectiveArgs, "benchtime")
 
+    def benchTimeWithFile(self, index, commsParams, backendFuncs):
+        # Get NW stack specific parameters
+        (
+            local_rank,
+            global_rank,
+            world_size,
+            group,
+            curDevice,
+            curHwDevice,
+            allSizes,
+            computeFunc,
+        ) = self.initCollectiveArgs(commsParams)
+
+        results = {}
+        timeElapsedList = []
+
+        with open(commsParams.bench_params_file) as f:
+            line = f.readline()
+            while line:
+                parameters = [int(p) for p in line.split(' ')]
+                assert world_size == len(parameters) - 2
+                device_id = curDevice.index
+                B = parameters[0]
+                D = parameters[-1]
+                T = parameters[1+device_id]
+                curSize = B * T * D * commsParams.element_size
+                assert (B % world_size == 0)
+
+                # Allocating memory.
+                numElements = int(curSize // commsParams.element_size)
+                scaleFactor = numElements * numElements
+
+                if commsParams.dcheck == 1:
+                    # use all ones for easy data validation check
+                    ipTensor = backendFuncs.alloc_ones(
+                        [numElements], curDevice, commsParams.dtype, self.initVal
+                    )
+                else:
+                    ipTensor = backendFuncs.alloc_random(
+                        [numElements], curDevice, commsParams.dtype, scaleFactor
+                    )
+
+                opTensor = ipTensor
+                asyncOp = True
+                collectiveFunc = None
+
+                if (
+                    commsParams.blockingFlag == 1
+                ):  # if blockingFlag is 1, it means asyncOp should be false.
+                    asyncOp = False
+
+                opTensor = backendFuncs.alloc_random(
+                    [(B // world_size) * sum(parameters[1:-1]) * D], curDevice, commsParams.dtype, scaleFactor
+                )
+                self.collectiveArgs.ipTensor_split = None
+                self.collectiveArgs.opTensor_split = [(B // world_size) * t * D for t in parameters[1:-1]]
+                collectiveFunc = backendFuncs.collectiveFunc[commsParams.collective]
+
+                # Setup the arguments.
+                self.collectiveArgs.ipTensor = ipTensor
+                self.collectiveArgs.opTensor = opTensor
+                self.collectiveArgs.asyncOp = asyncOp
+                self.collectiveArgs.dataSize = curSize
+                self.collectiveArgs.numElements = numElements
+                self.collectiveArgs.waitObj = []
+
+                collectiveFunc_pair = None
+                curSizes = ','.join([str(p) for p in parameters])
+
+                # self.collectiveArgs has all the information on the experiment.
+                results[curSizes] = self.runColl(
+                    comm_fn=collectiveFunc,
+                    compute_fn=computeFunc,
+                    comm_fn_pair=collectiveFunc_pair,
+                )
+
+                # perform data validation check on the final opTensor
+                if commsParams.dcheck == 1:
+                    self.dcheck(commsParams, curSize, opTensor)
+                results[curSizes]["num_elements"] = int(numElements // world_size)
+                timeElapsedList = [
+                    results[curSizes]["timeUS"],
+                    T,
+                    results[curSizes]["algBW"],
+                    results[curSizes]["busBW"]
+                ]
+
+                del ipTensor
+                del opTensor
+                backendFuncs.clear_memory(self.collectiveArgs)
+                self.backendFuncs.sync_barrier(
+                    self.collectiveArgs, desc=f"curSize_{B},{T},{D}"
+                )
+
+                tensorList = self.gatherBenchTime(
+                    self.collectiveArgs, commsParams, timeElapsedList
+                )
+
+                if global_rank == 0:
+                    runtime = '-'.join([str('{:.4f}'.format(t[0].item())) for t in tensorList])
+                    dimensions = str(B) + ',' + '-'.join([str(int(t[1].item())) for t in tensorList]) + ',' + str(D)
+                    algBW = '-'.join([str('{:.4f}'.format(t[2].item())) for t in tensorList])
+                    busBW = '-'.join([str('{:.4f}'.format(t[3].item())) for t in tensorList])
+                    print(
+                    "\tCOMMS-RES\t%12s\t%20s\t%28s\t%28s\t%28s"
+                        % (
+                            results[curSizes]["memSize"],
+                            dimensions,
+                            algBW,
+                            busBW,
+                            runtime
+                        )
+                    )
+
+                # wait rank 0 reports results to avoid other ranks mess up the output
+                self.backendFuncs.sync_barrier(self.collectiveArgs, "benchtime")
+
+                line = f.readline()
+
     def runBench(self, comms_world_info, commsParams):
         # Init the desired backend
         if commsParams.nw_stack == "pytorch-dist":
@@ -1198,7 +1326,8 @@ def main():
     )
 
     commsParams = comms_utils.commsParamsHolder(
-        args, comms_world_info, element_size, collBenchObj.benchTime
+        args, comms_world_info, element_size, 
+        collBenchObj.benchTime if args.bench_params_file is None else collBenchObj.benchTimeWithFile
     )
 
     if args.pair and args.overlap_pair_pgs:
