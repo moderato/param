@@ -732,7 +732,17 @@ class commsCollBench(paramCommsBench):
     def printPreamble(self, commsParams):
         logger.debug(f"\tcommsParams: {str(commsParams.__dict__)}")
         header = "\n\tCOMMS-RES"
-        if self.collectiveArgs.collective == "pt2pt":
+        if commsParams.bench_params_file:
+            header += (
+                "{:>15}{:>25}{:>25}{:>20}{:>20}".format(
+                    "size (B)",
+                    "B-T-D",
+                    "Latency(us):p50",
+                    "AlgBW(GB/s)",
+                    "BusBW(GB/s)",
+                )
+            )
+        elif self.collectiveArgs.collective == "pt2pt":
             header += "{:>15}{:>20}{:>10}{:>10}{:>25}{:>10}{:>10}{:>15}{:>15}{:>18}{:>18}".format(
                 "size (B)",
                 "pingLatency(us):p50",
@@ -1168,8 +1178,12 @@ class commsCollBench(paramCommsBench):
             computeFunc,
         ) = self.initCollectiveArgs(commsParams)
 
+        backendFuncs.sync_barrier(self.collectiveArgs)
+        if global_rank == 0:
+            self.printPreamble(commsParams)
+
         results = {}
-        timeElapsedList = []
+        resultList = []
 
         with open(commsParams.bench_params_file) as f:
             line = f.readline()
@@ -1234,8 +1248,7 @@ class commsCollBench(paramCommsBench):
                 # perform data validation check on the final opTensor
                 if commsParams.dcheck == 1:
                     self.dcheck(commsParams, curSize, opTensor)
-                results[curSizes]["num_elements"] = int(numElements // world_size)
-                timeElapsedList = [
+                resultList = [
                     results[curSizes]["timeUS"],
                     T,
                     results[curSizes]["algBW"],
@@ -1250,7 +1263,7 @@ class commsCollBench(paramCommsBench):
                 )
 
                 tensorList = self.gatherBenchTime(
-                    self.collectiveArgs, commsParams, timeElapsedList
+                    self.collectiveArgs, commsParams, resultList
                 )
 
                 if global_rank == 0:
@@ -1263,9 +1276,9 @@ class commsCollBench(paramCommsBench):
                         % (
                             results[curSizes]["memSize"],
                             dimensions,
+                            runtime,
                             algBW,
-                            busBW,
-                            runtime
+                            busBW
                         )
                     )
 
