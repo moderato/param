@@ -106,17 +106,17 @@ def run_op(op, op_lists, iters, warmup_iters, global_rank):
         batch_size, M, K, N = bmm_op.input_shapes[0][0], bmm_op.input_shapes[0][1], bmm_op.input_shapes[0][2], bmm_op.input_shapes[1][2]
         t = benchmark_fc(batch_size, M, N, K, iters, warmup_iters, backward=True)
     elif op.name == "aten::conv2d":
-        op_lists["conv"].append(op)
+        op_lists["conv2d"].append(op)
         batch_size, IC, IH, IW = op.input_shapes[0]
         OC, FH, FW = op.input_shapes[1][0], op.input_shapes[1][2], op.input_shapes[1][3]
         stride, _, dilation, is_dw = op.inputs[3][0], op.inputs[4][0], op.inputs[5][0], int(op.inputs[6] != 1)
-        t = benchmark_conv(batch_size, IH, IW, IC, OC, stride, dilation, FH, FW, is_dw, iters, warmup_iters)
+        t = benchmark_conv2d(batch_size, IH, IW, IC, OC, stride, dilation, FH, FW, is_dw, iters, warmup_iters)
     elif op.name == "CudnnConvolutionBackward":
-        conv_op = op_lists["conv"].pop()
+        conv_op = op_lists["conv2d"].pop()
         batch_size, IC, IH, IW = conv_op.input_shapes[0]
         OC, FH, FW = conv_op.input_shapes[1][0], conv_op.input_shapes[1][2], conv_op.input_shapes[1][3]
         stride, _, dilation, is_dw = conv_op.inputs[3][0], conv_op.inputs[4][0], conv_op.inputs[5][0], int(conv_op.inputs[6] != 1)
-        t = benchmark_conv(batch_size, IH, IW, IC, OC, stride, dilation, FH, FW, is_dw, iters, warmup_iters, backward=True)
+        t = benchmark_conv2d(batch_size, IH, IW, IC, OC, stride, dilation, FH, FW, is_dw, iters, warmup_iters, backward=True)
     elif op.name == "LookupFunction":
         op_lists["el"].append(op)
         T = op.input_shapes[1][0]
@@ -374,7 +374,7 @@ class ExgrReplayBench(paramCommsBench):
             "bce": [],
             "bmm": [],
             "bn": [],
-            "conv": [],
+            "conv2d": [],
             "el": [],
             "mm": [],
             "mse": [],

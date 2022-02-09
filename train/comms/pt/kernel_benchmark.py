@@ -34,12 +34,35 @@ def benchmark_torch_function(iters, warmup_iters, f, *args, **kwargs):
     return total_time / iters
 
 
-def benchmark_conv(batch_size, H, W, IC, OC, stride, dilation, FH, FW, is_dw, iters, warmup_iters, backward=False):
+def benchmark_conv2d(batch_size, H, W, IC, OC, stride, dilation, FH, FW, is_dw, iters, warmup_iters, backward=False):
     input_feature = torch.randn(batch_size, IC, H, W, requires_grad=True).cuda() # NCHW
     padding = []
     for f in [FH, FW]:
         padding.append((f - 1) // 2) # Only consider SAME with dilation = 1 for now
     conv = torch.nn.Conv2d(IC, OC, (FH, FW), stride=stride, dilation=dilation, padding=padding, groups=(IC if is_dw else 1)).cuda()
+
+    if not backward:
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            conv,
+            input_feature
+        )
+    else:
+        out = conv(input_feature)
+        time_per_iter = benchmark_torch_function(
+            iters,
+            warmup_iters,
+            out.mean().backward,
+            retain_graph=True
+        )
+    return time_per_iter
+
+
+# For parallel multi-head mm
+def benchmark_conv1d(batch_size, L, IC, OC, groups, iters, warmup_iters, backward):
+    input_feature = torch.randn(batch_size, IC * groups, L, requires_grad=True).cuda()
+    conv = torch.nn.Conv1d(IC * groups, OC * groups, kernel_size=1, groups=groups).cuda()
 
     if not backward:
         time_per_iter = benchmark_torch_function(
@@ -122,6 +145,7 @@ def benchmark_fc(batch_size, M, N, K, iters, warmup_iters, backward=False):
                 retain_graph=True,
             )
         return time_per_iter
+
 
 def benchmark_tril(batch_size, M, N, diag, iters, warmup_iters, backward=False):
     assert M == N, "Input tensor should be square!"
