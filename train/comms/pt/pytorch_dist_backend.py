@@ -465,6 +465,12 @@ class PyTorchDistBackend(backendFunctions):
             _sizeBytes = sum(
                 [t.nelement() * t.element_size() for t in collectiveArgs.ipTensor]
             )
+        # reduce_scatter_base should use input tensor for total memory size
+        elif collectiveArgs.collective == "reduce_scatter_base":
+            _sizeBytes = (
+                collectiveArgs.ipTensor.nelement()
+                * collectiveArgs.ipTensor.element_size()
+            )
         else:
             _sizeBytes = (
                 collectiveArgs.opTensor.nelement()
@@ -621,6 +627,12 @@ class PyTorchDistBackend(backendFunctions):
                     raise RuntimeError("Unable to import initialize_ucc_plugin")
                 else:
                     initialize_ucc_plugin(backend)
+        # Import Fairring
+        if backend == "fairring":
+            try:
+                import fairring  # noqa
+            except ImportError:
+                raise RuntimeError("Unable to import Fairring")
 
     def initialize_backend(self, master_ip, master_port, backend="gloo"):
         # Set CUDA device before initializing backend
