@@ -11,191 +11,20 @@ import argparse
 import json
 import logging
 import time
+import gc
+from replay_utils import *
 from os import path
+from collections import defaultdict
+
+from pprint import pprint
+import GPUtil
 
 import torch
 import comms_utils
-import numpy as np
 from comms_utils import paramCommsBench, paramTimer, paramProfile
-from exec_graph_utils import ExecutionGraph, NodeType
-from kernel_benchmark import *
+from exec_graph_utils import ExecutionGraph
 
 logger = logging.getLogger(__name__)
-
-def is_op(node):
-    return (node.type == NodeType.OPERATOR and node.parent.type != NodeType.OPERATOR)
-
-
-def is_forward(node):
-    forward = False
-    tmp = node
-    while tmp.parent is not None:
-        if 'DLRM forward' in tmp.name:
-            return True
-        tmp = tmp.parent
-
-    return forward
-
-
-CONSIDER = ["aten::linear", "AddmmBackward", "aten::bmm", "BmmBackward0", "aten::matmul", "MmBackward", \
-                "aten::conv2d", "CudnnConvolutionBackward", \
-                "LookupFunction", "LookupFunctionBackward", \
-                "aten::batch_norm", "CudnnBatchNormBackward", \
-                "aten::index", "IndexBackward", \
-                "aten::relu", "aten::relu_", "ReluBackward0", "ReluBackward1", \
-                "aten::sigmoid", "SigmoidBackward", \
-                "aten::binary_cross_entropy", "BinaryCrossEntropyBackward", \
-                "aten::mse_loss", "MseLossBackward", \
-                "aten::avg_pool2d", "AvgPool2D", \
-                "aten::max_pool2d", "MaxPool2DWithIndicesBackward", \
-                "aten::add", "aten::add_", "aten::__and__", "aten::cat", "aten::sum", "aten::to", "aten::ones_like", \
-                "torch::autograd::AccumulateGrad", "Optimizer.step#SGD.step", "Optimizer.zero_grad#SGD.zero_grad"]
-
-SKIP = ["aten::ones", "SliceBackward", "FusedDropoutBackward"]
-
-
-COMMS = ["nccl:all_to_all", "nccl:all_reduce"]
-
-
-def run_op(op, op_lists, iters, warmup_iters, global_rank):
-    t = 0
-    if op.name == "aten::linear":
-        transpose = None
-        for child in op.children:
-            if child.name == "aten::transpose":
-                transpose = child
-            elif child.name == "aten::t":
-                transpose = child.children[0]
-            elif "addmm" in child.name:
-                if transpose is not None:
-                    M, N = transpose.input_shapes[0][0], transpose.input_shapes[0][1]
-                    if (transpose.inputs[0], transpose.inputs[1]) == (1, 2):
-                        trans_type = 0
-                    elif (transpose.inputs[0], transpose.inputs[1]) == (0, 2):
-                        trans_type = 1
-                    else: # (0, 1)
-                        trans_type = 2
-                    t += benchmark_transpose(1, M, N, trans_type, iters, warmup_iters)
-                op_lists["addmm"].append(child)
-                M, K, N = child.input_shapes[1][0], child.input_shapes[1][1], child.input_shapes[2][1]
-                t = benchmark_linear(M, N, K, iters, warmup_iters)
-            elif child.name == "aten::matmul":
-                op_lists["mm"].append(child)
-                M, K, N = child.input_shapes[0][0] * child.input_shapes[0][1], child.input_shapes[0][2], child.input_shapes[1][1] if len(child.input_shapes[1]) > 1 else 1
-                t = benchmark_linear(M, N, K, iters, warmup_iters)
-    elif op.name == "AddmmBackward":
-        addmm_op = op_lists["addmm"].pop()
-        M, K, N = addmm_op.input_shapes[1][0], addmm_op.input_shapes[1][1], addmm_op.input_shapes[2][1]
-        t = benchmark_linear(M, N, K, iters, warmup_iters, backward=True)
-    elif op.name == "MmBackward":
-        mm_op = op_lists["mm"].pop()
-        M, K, N = mm_op.input_shapes[0][0] * mm_op.input_shapes[0][1], mm_op.input_shapes[0][2], mm_op.input_shapes[1][1] if len(mm_op.input_shapes[1]) > 1 else 1
-        t = benchmark_linear(M, N, K, iters, warmup_iters, backward=True)
-    elif op.name == "aten::matmul":
-        for child in op.children:
-            if "aten::bmm" in child.name:
-                op_lists["bmm"].append(child)
-                batch_size, M, K, N = child.input_shapes[0][0], child.input_shapes[0][1], child.input_shapes[0][2], child.input_shapes[1][2]
-                t = benchmark_fc(batch_size, M, N, K, iters, warmup_iters)
-    elif op.name == "aten::bmm":
-        op_lists["bmm"].append(op)
-        batch_size, M, K, N = op.input_shapes[0][0], op.input_shapes[0][1], op.input_shapes[0][2], op.input_shapes[1][2]
-        t = benchmark_fc(batch_size, M, N, K, iters, warmup_iters)
-    elif op.name == "BmmBackward0":
-        bmm_op = op_lists["bmm"].pop()
-        batch_size, M, K, N = bmm_op.input_shapes[0][0], bmm_op.input_shapes[0][1], bmm_op.input_shapes[0][2], bmm_op.input_shapes[1][2]
-        t = benchmark_fc(batch_size, M, N, K, iters, warmup_iters, backward=True)
-    elif op.name == "aten::conv2d":
-        op_lists["conv2d"].append(op)
-        batch_size, IC, IH, IW = op.input_shapes[0]
-        OC, FH, FW = op.input_shapes[1][0], op.input_shapes[1][2], op.input_shapes[1][3]
-        stride, _, dilation, is_dw = op.inputs[3][0], op.inputs[4][0], op.inputs[5][0], int(op.inputs[6] != 1)
-        t = benchmark_conv2d(batch_size, IH, IW, IC, OC, stride, dilation, FH, FW, is_dw, iters, warmup_iters)
-    elif op.name == "CudnnConvolutionBackward":
-        conv_op = op_lists["conv2d"].pop()
-        batch_size, IC, IH, IW = conv_op.input_shapes[0]
-        OC, FH, FW = conv_op.input_shapes[1][0], conv_op.input_shapes[1][2], conv_op.input_shapes[1][3]
-        stride, _, dilation, is_dw = conv_op.inputs[3][0], conv_op.inputs[4][0], conv_op.inputs[5][0], int(conv_op.inputs[6] != 1)
-        t = benchmark_conv2d(batch_size, IH, IW, IC, OC, stride, dilation, FH, FW, is_dw, iters, warmup_iters, backward=True)
-    elif op.name == "LookupFunction":
-        op_lists["el"].append(op)
-        T = op.input_shapes[1][0]
-        D = op.input_shapes[0][1]
-        B = int((op.input_shapes[3][0] - 1) / T)
-        E = int(op.input_shapes[0][0] / T)
-        L = int(op.input_shapes[2][0] / B / T)
-        rows_per_block = max(int(256 / D), 1)
-        t = benchmark_embedding_lookup(B, E, T, L, D, rows_per_block, iters, warmup_iters, backward=False, shmem=True, sgd=True)
-    elif op.name == "LookupFunctionBackward":
-        el_op = op_lists["el"].pop()
-        T = el_op.input_shapes[1][0]
-        D = el_op.input_shapes[0][1]
-        B = int((el_op.input_shapes[3][0] - 1) / T)
-        E = int(el_op.input_shapes[0][0] / T)
-        L = int(el_op.input_shapes[2][0] / B / T)
-        rows_per_block = max(int(256 / D), 1)
-        t = benchmark_embedding_lookup(B, E, T, L, D, rows_per_block, iters, warmup_iters, backward=True, shmem=True, sgd=True)
-    elif op.name == "aten::batch_norm":
-        op_lists["bn"].append(op)
-        if len(op.input_shapes[0]) == 4:
-            batch_size, OC, H, _ = op.input_shapes[0] # BN 2D
-        elif len(op.input_shapes[0]) == 3:
-            batch_size, OC, H = op.input_shapes[0] # BN 1D with 3D input
-        else:
-            batch_size, OC = op.input_shapes[0] # BN 1D with 2D input
-            H = 1
-        t = benchmark_bn(batch_size, H, H, OC, iters, warmup_iters)
-    elif op.name == "CudnnBatchNormBackward":
-        bn_op = op_lists["bn"].pop()
-        batch_size, OC, H, _ = bn_op.input_shapes[0]
-        t = benchmark_bn(batch_size, H, H, OC, iters, warmup_iters, backward=True)
-    elif op.name == "aten::index":
-        op_lists["tril"].append(op)
-        batch_size, M, N = op.input_shapes[0][0], op.input_shapes[0][1], op.input_shapes[0][2]
-        total_output_element = op.input_shapes[1][1][0]
-        if total_output_element == int(M * (1+N) / 2):
-            diag = 1
-        else:
-            diag = 0
-        t = benchmark_tril(batch_size, M, N, diag, iters, warmup_iters)
-    elif op.name == "IndexBackward": # See all kernels as a whole
-        tril_op = op_lists["tril"].pop()
-        batch_size, M, N = tril_op.input_shapes[0][0], tril_op.input_shapes[0][1], tril_op.input_shapes[0][2]
-        total_output_element = tril_op.input_shapes[1][1][0]
-        if total_output_element == int(M * (1+N) / 2):
-            diag = 1
-        else:
-            diag = 0
-        t = benchmark_tril(batch_size, M, N, diag, iters, warmup_iters, backward=True)
-    elif op.name == "aten::cat":
-        sizes = [tuple(s) for s in op.input_shapes[0] if s]
-        dim = op.inputs[-1]
-        t = benchmark_concat(sizes, dim, iters, warmup_iters)
-    elif op.name == "aten::to":
-        device = "cuda:{}".format(global_rank)
-        if device in op.inputs:
-            s = np.prod(op.input_shapes[0])
-            t = benchmark_memcpy(s, iters, warmup_iters)
-    elif op.name in ["aten::relu", "aten::relu_"]:
-        op_lists["relu"].append(op)
-        s = np.prod(op.input_shapes[0])
-        t = benchmark_relu(s, iters, warmup_iters)
-    elif op.name in ["ReluBackward0", "ReluBackward1"]:
-        relu_op = op_lists["relu"].pop()
-        s = np.prod(relu_op.input_shapes[0])
-        t = benchmark_relu(s, iters, warmup_iters, backward=True)
-    elif op.name == "aten::max_pool2d" or op.name == "aten::max_pool2d_with_indices":
-        op_lists["max_pool"].append(op)
-        batch_size, C, H, W = op.input_shapes[0]
-        FH, FW, stride, dilation = op.inputs[1][0], op.inputs[1][1], op.inputs[2][0], op.inputs[4][0]
-        t = benchmark_pool(batch_size, H, W, C, stride, dilation, FH, FW, "max", iters, warmup_iters)
-    elif op.name == "aten::avg_pool2d" or op.name == "aten::avg_pool2d_with_indices":
-        op_lists["avg_pool"].append(op)
-        batch_size, C, H, W = op.input_shapes[0]
-        FH, FW, stride, dilation = op.inputs[1][0], op.inputs[1][1], op.inputs[2][0], op.inputs[4][0]
-        t = benchmark_pool(batch_size, H, W, C, stride, dilation, FH, FW, "avg", iters, warmup_iters)
-    # print(op.name, op.input_shapes, t)
-    return t
 
 
 class ExgrReplayBench(paramCommsBench):
@@ -207,6 +36,7 @@ class ExgrReplayBench(paramCommsBench):
         self.is_blocking = True
         self.do_warm_up = True
         self.allowList = ""
+        self.tensor_registry = []
 
         self.strToTorchDtype = {
             "Byte": torch.uint8,
@@ -215,6 +45,40 @@ class ExgrReplayBench(paramCommsBench):
             "Long": torch.long,
             "Double": torch.double,
         }
+
+    def run_op(self, node):
+        # print("-----")
+        # print(node.name, node.inputs, node.input_shapes)
+        inputs = [
+            self.tensor_registry[item] if is_tensor(node, idx) else \
+            (
+                None if item == '<None>' else \
+                (
+                    tuple(item) if isinstance(item, list) else item
+                )
+            ) for idx, item in enumerate(node.inputs)
+        ]
+        # print(node.name, [(type(i), i.shape if torch.is_tensor(i) else i) for i in inputs])
+        output_id = node.outputs[0]
+        func = self.funcs[node.id]
+        output = func(*inputs)
+        # print("Dependency count")
+        # pprint(self.dependency)
+        for idx, input_id in enumerate(node.inputs):
+            # Only consider tensor id
+            if not is_tensor(node, idx):
+                continue
+            # print(input_id, self.dependency[input_id])
+            self.dependency[input_id] -= 1
+            # print(input_id, self.dependency[input_id])
+            if self.dependency[input_id] == 0:
+                # print("delete tensor {}".format(input_id))
+                del self.tensor_registry[input_id]
+        self.tensor_registry[output_id] = output
+        # GPUtil.showUtilization()
+        # print("Tensor registry")
+        # print(self.tensor_registry.keys())
+
 
     def readArgs(self, parser):
         # read the common/basic arguments
@@ -368,49 +232,142 @@ class ExgrReplayBench(paramCommsBench):
             # only one tensor required for allreduce, reduce and broadcast
             self.collectiveArgs.opTensor = self.collectiveArgs.ipTensor
 
-    def benchTime(self):
-        op_lists = {
-            "addmm": [],
-            "bce": [],
-            "bmm": [],
-            "bn": [],
-            "conv2d": [],
-            "el": [],
-            "mm": [],
-            "mse": [],
-            "relu": [],
-            "sigmoid": [],
-            "tril": [],
-            "max_pool": [],
-            "avg_pool": []
-        }
+    def reset_registry(self):
+        self.tensor_registry = {}
+        self.op_registry = {}
+        self.dependency = self.dependency_permanent.copy()
+        self.tensor_registry = {k: v.cuda() for k, v in self.tensor_registry_permanent.items()}
+        gc.collect()
+        torch.cuda.empty_cache()
 
+    def preprocess_graph(self):
+        self.dependency_permanent = defaultdict(int)
+        self.tensor_registry_permanent = {}
+
+        # Sort and filter nodes
+        # edge case 1 (?): aten::addmm has a sub op aten::expand (i.e. not the lowest level) that operates a tensor needed in the future
         nodes = self.exgr.get_nodes(clean=True)
         sorted_nodes = sorted(nodes.items(), key=lambda x: x[0])
-        sorted_nodes = [(id, node) for id, node in sorted_nodes if is_op(node)] # Filter modules, kernels, etc
+        # Method 1: Manually choose ops (same as the current perf model, might be good for python-based replay if we need it)
+        # self.sorted_nodes = [
+        #     (id, node) for id, node in sorted_nodes 
+        #     if is_op(node) and not to_skip(node) and to_consider(node)
+        # ] # Filter modules, kernels, etc
+        ##############
+        # Method 2: aten in BW and op in FW (works for now)
+        # self.sorted_nodes = [
+        #     (id, node) for id, node in sorted_nodes 
+        #     if (is_backward_aten(node)) or
+        #         (is_op(node) and not is_backward(node)) # and to_consider(node))
+        # ] # Filter modules, kernels, etc
+        ##############
+        # Method 3: lowest aten for both BW and FW (also works)
+        self.sorted_nodes = [(id, node) for id, node in sorted_nodes if (is_lowest_level_aten(node))] # Filter modules, kernels, etc
+        # pprint([(id, node.name) for id, node in self.sorted_nodes])
 
+        # Tensors dependency
+        for tid in self.exgr.tensors:
+            for _, n in self.sorted_nodes:
+                for idx, ip in enumerate(n.inputs):
+                    if tid == ip and is_tensor(n, idx):
+                        self.dependency_permanent[tid] += 1
+        
+        # Mark all intermediate tensors
+        intermediate = set()
+        input_set = set()
+        for _, n in self.sorted_nodes:
+            for idx, ip in enumerate(n.inputs):
+                if is_tensor(n, idx) and ip in self.dependency_permanent.keys():
+                    input_set.add(ip)
+
+            # Tensors occurred as inputs before are not to be removed
+            for o in n.outputs:
+                if o in self.dependency_permanent and \
+                        o not in input_set:
+                    intermediate.add(o)
+
+        # Instantiation of tensors:
+        # edge case 1: one tensor id is reused multiple times, and each time has a different shape (taking the first shape should work?)
+        for _, n in self.sorted_nodes:
+            for idx, ip in enumerate(n.inputs):
+                if is_tensor(n, idx) and \
+                        ip not in self.tensor_registry_permanent.keys() and \
+                        ip in self.dependency_permanent.keys() and \
+                        ip not in intermediate: # Only take the first size
+                    self.tensor_registry_permanent[ip] = torch.randn(n.input_shapes[idx], requires_grad=True)
+
+        # Build aten funcs
+        self.funcs = {}
+        for _, n in self.sorted_nodes:
+            input_count = len(n.input_types)
+            # parse_schema doesn't fit well
+            # func_schema = torch._C.parse_schema(n.op_schema)
+            # edge case 1: int[1] in aten::sum (manually fixed for now)
+            # edge case 2: * in aten::emtpy_strided (currently don't see anything bad)
+
+            types = [item for item in n.op_schema.split(' ') if ',' not in item]
+            input_types = [item if 'Tensor' not in item else 'Tensor' for item in types[:-3]]
+            input_types[0] = re.sub(r'^.*?\(', '', input_types[0]) # Strip the op name
+            output_type = types[-1] if 'Tensor' not in types[-1] else 'Tensor'
+            output_type = output_type.lstrip('(').rstrip(')')
+
+            inputStr = """
+                graph({}):
+                    %{}: {} = {}({})
+                    return (%{})
+            """.format(
+                ", ".join(["%{}: {}".format(idx, t) for idx, t in enumerate(input_types)]),
+                input_count + 1,
+                output_type,
+                n.name,
+                ", ".join(["%{}".format(idx) for idx in range(input_count)]),
+                input_count + 1,
+            )
+
+            # print(inputStr)
+            # print("=============")
+            graph = torch._C.parse_ir(inputStr)
+            cu = torch._C.CompilationUnit()
+            func = cu.create_function(n.name, graph)
+            self.funcs[n.id] = func
+
+        # Reset
+        self.reset_registry()
+
+
+    def benchTime(self):
+        self.preprocess_graph()
         time_per_iter = 0
-        for _, node in sorted_nodes:
-            if node.name in SKIP:
-                continue
-            if node.name in "record_param_comms":
-                op = None
-                # Get the collective node
-                def dfs(n):
-                    nonlocal op
-                    if n.name in COMMS:
-                        op = n
-                    for c in n.children:
-                        dfs(c)
-                dfs(node)
-                if op is not None:
-                    self.prepComms(op)
-                    latency, _ = self.runComms(op.name.split("nccl:")[-1])
-                    time_per_iter += latency / 1e3 # In ms
-            if node.name in CONSIDER:
-                # TODO: use PARAM's compute microbenchmark for this
-                t = 1e3 * run_op(node, op_lists, self.numIters, self.numWarmupIters, self.global_rank) # In ms
-                time_per_iter += t
+
+        # print(self.dependency_permanent)
+        for iters in range(self.numWarmupIters + self.numIters):
+            event_1 = torch.cuda.Event(enable_timing=True)
+            event_2 = torch.cuda.Event(enable_timing=True)
+            event_1.record()
+            for _, node in self.sorted_nodes:
+                # TODO: Fix communication ops
+                # if node.name in "record_param_comms":
+                #     op = None
+                #     # Get the collective node
+                #     def dfs(n):
+                #         nonlocal op
+                #         if n.name in COMMS:
+                #             op = n
+                #         for c in n.children:
+                #             dfs(c)
+                #     dfs(node)
+                #     if op is not None:
+                #         self.prepComms(op)
+                #         latency, _ = self.runComms(op.name.split("nccl:")[-1])
+                #         time_per_iter += latency / 1e3 # In ms
+                self.run_op(node)
+            event_2.record()
+            torch.cuda.synchronize()
+            if iters >= self.numWarmupIters:
+                time_per_iter += event_1.elapsed_time(event_2) / self.numIters
+            # print("=============")
+            self.reset_registry()
+
         print("Rank {}: {:.2f} ms".format(self.global_rank, time_per_iter))
 
     def reportBenchTime(self, *args, **kwargs):
@@ -500,7 +457,7 @@ class ExgrReplayBench(paramCommsBench):
 
 
 def main():
-    mpi_env_params = comms_utils.read_mpi_env_vars()
+    mpi_env_params = comms_utils.read_comms_env_vars()
 
     exgrBench = ExgrReplayBench()
     parser = argparse.ArgumentParser(
