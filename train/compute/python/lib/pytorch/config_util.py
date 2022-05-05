@@ -12,15 +12,28 @@ import torch
 from torch.utils.collect_env import get_nvidia_driver_version
 from torch.utils.collect_env import run as run_cmd
 
-from ...lib import __version__ as param_bench_version
+from ...lib import __version__
 
 
 @enum.unique
 class ExecutionPass(enum.Enum):
     # Forward pass will always run (also required for backward pass).
     FORWARD = "forward"
+
     # Run backward pass in addition to forward pass.
     BACKWARD = "backward"
+
+
+@enum.unique
+class OpExecutionMode(enum.Enum):
+    # Run operator seprately and clear cache between each call.
+    DISCRETE = "discrete"
+
+    # Run operator back to back without clear cache, etc.
+    CONTINUOUS = "continuous"
+
+    # Run operator back to back but record indivisual events.
+    CONTINUOUS_EVENTS = "continuous_events"
 
 
 def get_op_run_id(op_name: str, run_id: str) -> str:
@@ -33,13 +46,26 @@ def get_benchmark_options() -> Dict[str, Any]:
         "pass_type": ExecutionPass.FORWARD,
         "warmup": 1,
         "iteration": 1,
+        "op_exec_mode": OpExecutionMode.DISCRETE,
+        "cuda_l2_cache": False,
         "time_unit": "millisecond",
         "out_file_prefix": None,
         "out_stream": None,
         "run_ncu": False,
+        "ncu_bin": "/usr/local/NVIDIA-Nsight-Compute-2021.2/ncu",
         "ncu_args": "",
-        "ncu_batch": 50,
+        "ncu_warmup": 5,
+        "ncu_iteration": 1,
+        "run_nsys": False,
+        "nsys_bin": "/opt/nvidia/nsight-systems/2021.4.1/bin/nsys",
+        "nsys_args": "",
+        "nsys_warmup": 5,
+        "nsys_iteration": 10,
+        "run_batch_size": 50,
+        "batch_cuda_device": 1,
+        "batch_cmd": "python -m param_bench.train.compute.python.pytorch.run_batch",
         "resume_op_run_id": None,
+        "stop_op_run_id": None,
     }
 
     return options
@@ -63,7 +89,7 @@ def create_op_args(args: List[Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
     return {"args": args, "kwargs": kwargs}
 
 
-_pytorch_data: Dict[str, Any] = {
+_pytorch_type: Dict[str, Any] = {
     "int": {"type": "int", "value": None},
     "int_range": {"type": "int", "value_range": None},
     "long": {"type": "long", "value": None},
@@ -81,8 +107,8 @@ _pytorch_data: Dict[str, Any] = {
 }
 
 
-def create_data(type) -> Dict[str, Any]:
-    return copy.deepcopy(_pytorch_data[type])
+def create_type(type) -> Dict[str, Any]:
+    return copy.deepcopy(_pytorch_type[type])
 
 
 def get_sys_info():
@@ -107,7 +133,7 @@ def get_sys_info():
         "pid": os.getpid(),
         "cwd": os.getcwd(),
         "python_version": platform.python_version(),
-        "param_bench_version": param_bench_version,
+        "param_train_compute_version": __version__,
         "cuda_available": cuda_available,
         **cuda_info,
         "pytorch_version": torch.__version__,

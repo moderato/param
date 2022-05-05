@@ -31,7 +31,9 @@ supportedCollectives = [
     "all_gather_base",
     "incast",
     "multicast",
-]  # , "scatter", "gather"]
+    "gather",
+    "scatter",
+]
 pt2ptPatterns = [
     "one2one",
     "pairwise",
@@ -61,7 +63,7 @@ class commsCollBench(paramCommsBench):
             "--w", type=int, default=5, help="number of warmup iterations"
         )  # number of warmup-iterations
         parser.add_argument(
-            "--n", type=int, default=5, help="number of iterations"
+            "--n", "--num_iters", type=int, default=5, help="number of iterations"
         )  # number of iterations
         # experiment related parameters
         parser.add_argument(
@@ -755,6 +757,11 @@ class commsCollBench(paramCommsBench):
     def printPreamble(self, commsParams):
         logger.debug(f"\tcommsParams: {str(commsParams.__dict__)}")
         header = "\n\tCOMMS-RES"
+
+        tflops_fmt = ""
+        if commsParams.kernel == "gemm" and commsParams.mode != "comms":
+            tflops_fmt = "{:>15}"
+
         if commsParams.bench_params_file:
             header += (
                 "{:>15}{:>25}{:>25}{:>20}{:>20}".format(
@@ -766,7 +773,8 @@ class commsCollBench(paramCommsBench):
                 )
             )
         elif self.collectiveArgs.collective == "pt2pt":
-            header += "{:>15}{:>20}{:>10}{:>10}{:>25}{:>10}{:>10}{:>15}{:>15}{:>18}{:>18}".format(
+            fmt = "{:>15}{:>20}{:>10}{:>10}{:>25}{:>10}{:>10}{:>15}{:>15}{:>18}{:>18}" + tflops_fmt
+            header += fmt.format(
                 "size (B)",
                 "pingLatency(us):p50",
                 "p75",
@@ -778,33 +786,37 @@ class commsCollBench(paramCommsBench):
                 "avgBiBW(GB/s)",
                 "totalUniBW(GB/s)",
                 "totalBiBW(GB/s)",
+                "TFlops",
             )
         else:
             if commsParams.bitwidth < 32:
-                header += "-QUANT\t{:>15}{:>18}{:>25}{:>15}{:>15}{:>15}".format(
+                fmt = "-QUANT\t{:>15}{:>18}{:>25}{:>15}{:>15}{:>15}" + tflops_fmt
+                header += fmt.format(
                     "size (B)",
                     "nElementsPerRank",
                     "P95 Latency(us): Quant",
                     "Comms",
                     "De-Quant",
                     "Overall",
+                    "TFlops",
                 )
             elif not self.collectiveArgs.pair:
-                header += (
-                    "{:>15}{:>18}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}".format(
-                        "size (B)",
-                        "nElementsPerRank",
-                        "Latency(us):p50",
-                        "p75",
-                        "p95",
-                        "Min",
-                        "Max",
-                        "AlgBW(GB/s)",
-                        "BusBW(GB/s)",
-                    )
+                fmt = "{:>15}{:>18}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}" + tflops_fmt
+                header += fmt.format(
+                    "size (B)",
+                    "nElementsPerRank",
+                    "Latency(us):p50",
+                    "p75",
+                    "p95",
+                    "Min",
+                    "Max",
+                    "AlgBW(GB/s)",
+                    "BusBW(GB/s)",
+                    "TFlops",
                 )
             else:
-                header += "{:>15}{:>18}{:>22}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}".format(
+                fmt = "{:>15}{:>18}{:>22}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}" + tflops_fmt
+                header += fmt.format(
                     "total-size (B)",
                     "nElementsPerRank",
                     "nElementsPairPerRank",
@@ -815,6 +827,7 @@ class commsCollBench(paramCommsBench):
                     "Max",
                     "AlgBW(GB/s)",
                     "BusBW(GB/s)",
+                    "TFlops",
                 )
 
         print(header)
@@ -878,7 +891,7 @@ class commsCollBench(paramCommsBench):
         if commsParams.bench_params_file is None:
             return
         # convernt num_elements to # of elements per rank
-        if commsParams.collective in ("all_to_all", "all_to_allv"):
+        if commsParams.collective in ("all_to_all", "all_to_allv", "reduce_scatter", "reduce_scatter_base", "all_gather", "all_gather_base"):
             results["numElements"] = int(
                 results["numElements"] // commsParams.comms_world_info.world_size
             )
@@ -921,6 +934,10 @@ class commsCollBench(paramCommsBench):
             % (commRanks, latencyAcrossCommRanks)
         )
 
+        m = commsParams.mm_dim
+        tflop = (2 * m * m * m) * self.collectiveArgs.numComputePerColl * 1e-12
+        secs = results["timeUS"] * 1e-6
+        tflops = tflop / secs
         p50 = np.percentile(latencyAcrossCommRanks, 50)
         p75 = np.percentile(latencyAcrossCommRanks, 75)
         p95 = np.percentile(latencyAcrossCommRanks, 95)
@@ -930,9 +947,14 @@ class commsCollBench(paramCommsBench):
         # adjust busBW
         busBW = results["busBW"] * (commsParams.bitwidth / 32.0)
 
+        tflops_fmt = ""
+        if commsParams.kernel == "gemm" and commsParams.mode != "comms":
+            tflops_fmt = "{:>15}"
+
         if not self.collectiveArgs.pair:
+            fmt = "\tCOMMS-RES{:>15}{:>18}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}" + tflops_fmt
             print(
-                "\tCOMMS-RES{:>15}{:>18}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}".format(
+                fmt.format(
                     results["memSize"],
                     str("%d" % (results["numElements"])),
                     str("%.1f" % (p50)),
@@ -942,6 +964,7 @@ class commsCollBench(paramCommsBench):
                     str("%.1f" % (maxlat)),
                     str("%.3f" % (results["algBW"])),
                     str("%.3f" % (busBW)),
+                    str("%.5f" % (tflops)),
                 )
             )
         else:
@@ -951,8 +974,9 @@ class commsCollBench(paramCommsBench):
                     results["numElements_pair"]
                     // commsParams.comms_world_info.world_size
                 )
+            fmt = "\tCOMMS-RES{:>15}{:>18}{:>22}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}" + tflops_fmt
             print(
-                "\tCOMMS-RES{:>15}{:>18}{:>22}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}".format(
+                fmt.format(
                     results["memSize"],
                     str("%d" % (results["numElements"])),
                     str("%d" % (results["numElements_pair"])),
@@ -963,6 +987,7 @@ class commsCollBench(paramCommsBench):
                     str("%.1f" % (maxlat)),
                     str("%.3f" % (results["algBW"])),
                     str("%.3f" % (busBW)),
+                    str("%.5f" % (tflops)),
                 )
             )
 

@@ -173,11 +173,9 @@ class PyTorchDistBackend(backendFunctions):
         if collectiveArgs.all2all_qcomm and not pair:
             work = all_to_all_internal(collectiveArgs)
         else:
-            work = dist.all_to_all_single(
+            work = dist.all_to_all(
                 collectiveArgs.opTensor if not pair else collectiveArgs.opTensor_pair,
                 collectiveArgs.ipTensor if not pair else collectiveArgs.ipTensor_pair,
-                None,
-                None,
                 group=collectiveArgs.group,
                 async_op=collectiveArgs.asyncOp,
             )
@@ -238,6 +236,54 @@ class PyTorchDistBackend(backendFunctions):
         if retFlag:
             return retObj
 
+    def gather(self, collectiveArgs, retFlag=False, pair=False):
+        if pair:
+            ipTensors = collectiveArgs.ipTensor_pair
+            opTensors = collectiveArgs.opTensor_pair
+        else:
+            ipTensors = collectiveArgs.ipTensor
+            opTensors = collectiveArgs.opTensor
+
+        retObj = dist.gather(
+            gather_list=opTensors
+            if (collectiveArgs.global_rank == collectiveArgs.srcOrDst)
+            else None,
+            tensor=ipTensors,
+            dst=collectiveArgs.srcOrDst,
+            group=collectiveArgs.group,
+            async_op=collectiveArgs.asyncOp,
+        )  # synchronicity is maintained in runColl
+
+        if collectiveArgs.asyncOp:
+            collectiveArgs.waitObj.append(retObj)
+
+        if retFlag:
+            return retObj
+
+    def scatter(self, collectiveArgs, retFlag=False, pair=False):
+        if pair:
+            ipTensors = collectiveArgs.ipTensor_pair
+            opTensors = collectiveArgs.opTensor_pair
+        else:
+            ipTensors = collectiveArgs.ipTensor
+            opTensors = collectiveArgs.opTensor
+
+        retObj = dist.scatter(
+            tensor=opTensors,
+            scatter_list=ipTensors
+            if (collectiveArgs.global_rank == collectiveArgs.srcOrDst)
+            else None,
+            src=collectiveArgs.srcOrDst,
+            group=collectiveArgs.group,
+            async_op=collectiveArgs.asyncOp,
+        )  # synchronicity is maintained in runColl
+
+        if collectiveArgs.asyncOp:
+            collectiveArgs.waitObj.append(retObj)
+
+        if retFlag:
+            return retObj
+
     def reduce_scatter(self, collectiveArgs, retFlag=False, pair=False):
         retObj = dist.reduce_scatter(
             output=collectiveArgs.opTensor,
@@ -273,21 +319,6 @@ class PyTorchDistBackend(backendFunctions):
             group=collectiveArgs.group,
             async_op=collectiveArgs.asyncOp,
         )  # synchronicity is maintained in runColl
-
-        if collectiveArgs.asyncOp:
-            collectiveArgs.waitObj.append(retObj)
-
-        if retFlag:
-            return retObj
-
-    def gather(self, collectiveArgs, retFlag=False):
-        retObj = dist.gather(
-            tensor=collectiveArgs.ipTensor,
-            gather_list=collectiveArgs.opTensor,
-            dst=collectiveArgs.srcOrDst,
-            group=collectiveArgs.group,
-            async_op=collectiveArgs.asyncOp,
-        )
 
         if collectiveArgs.asyncOp:
             collectiveArgs.waitObj.append(retObj)
@@ -499,10 +530,14 @@ class PyTorchDistBackend(backendFunctions):
             ipTensor = torch.randint(
                 low=0, high=10, size=sizeArr, device=curRankDevice, dtype=dtype
             )
+        elif dtype == torch.bool:
+            ipTensor = (
+                torch.rand(sizeArr, device=curRankDevice, dtype=torch.float32) < 0.5
+            )
         else:
             ipTensor = torch.rand(sizeArr, device=curRankDevice, dtype=dtype)
-        if (scaleFactor) != 0:
-            ipTensor = ipTensor / scaleFactor
+            if (scaleFactor) != 0:
+                ipTensor = ipTensor / scaleFactor
         return ipTensor
 
     def alloc_embedding_tables(self, n, m, curRankDevice, dtype):
