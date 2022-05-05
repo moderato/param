@@ -45,7 +45,7 @@ def is_backward(op):
 
 def is_backward_aten(op):
     return op.name.startswith("aten::") and \
-            not op.children and \
+            (not op.children or op.name == "aten::convolution_backward") and \
             has_backward_parent(op)
 
 
