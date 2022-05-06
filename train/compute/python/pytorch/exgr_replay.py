@@ -36,6 +36,8 @@ class ExgrReplayManager:
         ]
         # print(node.name, node.id, [(type(i), i.shape if torch.is_tensor(i) else i, i.dtype if torch.is_tensor(i) else i) for i in inputs], type(node.outputs[0]))
         func, output_count = self.funcs[node.id]
+        if node.name == "aten::convolution_backward":
+            inputs[-1] = [True, True, True]
         if output_count == 1:
             outputs = (func(*inputs),)
         else:
@@ -89,7 +91,7 @@ class ExgrReplayManager:
                 for idx, ip in enumerate(n.inputs):
                     if tid == ip and is_tensor(n, idx):
                         self.dependency_permanent[tid] += 1
-        
+
         # Mark all intermediate tensors
         intermediate = set()
         input_set = set()
@@ -164,8 +166,8 @@ class ExgrReplayManager:
             event_1.record()
             for _, node in self.sorted_nodes:
                 self.run_op(node)
-                event_2.record()
-                torch.cuda.synchronize()
+            event_2.record()
+            torch.cuda.synchronize()
             if iter >= self.numWarmupIters:
                 total_time += event_1.elapsed_time(event_2)
             self.reset_registry()
