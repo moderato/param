@@ -27,6 +27,7 @@ class ExgrReplayManager:
         self.numIters = args.iteration
 
     def run_op(self, node):
+        # print("-----")
         # print(node.name, node.inputs, node.input_shapes)
         inputs = [
             self.tensor_registry[item] if is_tensor(node, idx) else \
@@ -34,14 +35,17 @@ class ExgrReplayManager:
                 None if item == '<None>' else item
             ) for idx, item in enumerate(node.inputs)
         ]
-        # print(node.name, node.id, [(type(i), i.shape if torch.is_tensor(i) else i, i.dtype if torch.is_tensor(i) else i) for i in inputs], type(node.outputs[0]))
-        func, output_count = self.funcs[node.id]
+        # Workaround to eliminate the "strides() called on undefined Tensor" error
         if node.name == "aten::convolution_backward":
             inputs[-1] = [True, True, True]
+
+        # print(node.name, node.id, [(type(i), i.shape if torch.is_tensor(i) else i, i.dtype if torch.is_tensor(i) else i) for i in inputs], type(node.outputs[0]))
+        func, output_count = self.funcs[node.id]
         if output_count == 1:
             outputs = (func(*inputs),)
         else:
             outputs = func(*inputs)
+
         # print("Dependency count")
         # pprint(self.dependency)
         for idx, input_id in enumerate(node.inputs):
@@ -63,27 +67,31 @@ class ExgrReplayManager:
         self.tensor_registry = {}
         self.op_registry = {}
         self.dependency = self.dependency_permanent.copy()
-        self.tensor_registry = {k: v.cuda() for k, v in self.tensor_registry_permanent.items()}
+        self.tensor_registry = {k: (v.cuda() if v is not None else None) for k, v in self.tensor_registry_permanent.items()}
         gc.collect()
         torch.cuda.empty_cache()
 
     def preprocess_graph(self):
         self.dependency_permanent = defaultdict(int)
         self.tensor_registry_permanent = {}
-
-        # Sort and filter nodes
         nodes = self.exgr.get_nodes(clean=True)
-        sorted_nodes = sorted(nodes.items(), key=lambda x: x[0])
+
         # Filter modules, kernels, etc
         # FW: Pytorch level ops (to prevent cases like aten::addmm having a sub op aten::expand (i.e. not the lowest level) that operates a tensor needed in the future)
         # BW: All lowest aten ops
+        # Detail of exceptions in replay_utils.py
+        sorted_nodes = {
+            id: node for id, node in sorted(nodes.items(), key=lambda x: x[0]) if is_qualified(node)
+        }
+        redundant_node_ids = set()
+        for _, node in sorted_nodes.items():
+            redundant_node_ids.update([n.id for n in node.children])
         self.sorted_nodes = [
-            (id, node) for id, node in sorted_nodes 
-            if (is_backward_aten(node)) or
-                (is_op(node) and not is_backward(node))
+            (id, node) for id, node in sorted_nodes.items() if id not in redundant_node_ids
         ]
         # from pprint import pprint
         # pprint([(id, node.name) for id, node in self.sorted_nodes])
+        # exit()
 
         # Tensors dependency
         for tid in self.exgr.tensors:
@@ -113,9 +121,13 @@ class ExgrReplayManager:
                         ip not in self.tensor_registry_permanent.keys() and \
                         ip in self.dependency_permanent.keys() and \
                         ip not in intermediate: # Only take the first size
-                    dtype, rng = TORCH_DTYPES_RNG[n.input_types[idx].lstrip('Tensor(').rstrip(')')]
-                    self.tensor_registry_permanent[ip] = \
-                        rng(n.input_shapes[idx], requires_grad=True).to(dtype)
+                    try:
+                        dtype, rng = TORCH_DTYPES_RNG[n.input_types[idx].lstrip('Tensor(').rstrip(')')]
+                        self.tensor_registry_permanent[ip] = rng(n.input_shapes[idx]).to(dtype)
+                    except KeyError:
+                        self.tensor_registry_permanent[ip] = None
+                    # except:
+                    #     print(n.name, n.id, ip, n.input_shapes[idx])
 
         # Build aten funcs
         self.funcs = {}
@@ -138,7 +150,8 @@ class ExgrReplayManager:
                     return (%output)
             """.format(
                 ", ".join(["%{}: {}".format(idx, t) for idx, t in enumerate(input_types)]),
-                "%output: {}".format(output_types[0]) if output_count == 1 else ", ".join(["%{}: {}".format(idx + input_count, t) for idx, t in enumerate(output_types)]),
+                "%output: {}".format(output_types[0]) if output_count == 1 else \
+                    ", ".join(["%{}: {}".format(idx + input_count, t) for idx, t in enumerate(output_types)]),
                 n.name,
                 ", ".join(["%{}".format(idx) for idx in range(input_count)]),
                 "%output : ({}) = prim::TupleConstruct({})".format(
@@ -227,7 +240,7 @@ def main():
             total_time = 0.0
 
             # Warmup
-            for _ in range(5):
+            for _ in range(10):
                 optimizer.zero_grad()
                 output = an(data)
                 loss = criterion(output, target)

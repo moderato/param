@@ -17,6 +17,27 @@ TORCH_DTYPES_RNG = {
 }
 
 
+YES_OPS = {
+    "aten::convolution_backward", # Not the lowest BW aten
+    "aten::max_pool2d_with_indices_backward", # ...
+    "aten::nll_loss_backward", # ...
+    "aten::_adaptive_avg_pool2d_backward", # ...
+
+    "aten::max_pool2d_with_indices", # More outputs than its parent op
+    "aten::log_softmax", # Together with nll_loss_forward
+    "aten::nll_loss_forward", # More outputs than its parent op
+    "aten::native_dropout", # More outputs than its parent op
+}
+
+
+NO_OPS = {
+    "aten::max_pool2d", # Has only one output explicitly but its child op implicitly has two (aten::max_pool2d_with_indices)
+    "aten::dropout", # ... (aten::native_dropout)
+    "aten::cross_entropy_loss", # ... (aten::nll_loss_forward)
+    "aten::nll_loss_nd", # ... (aten::nll_loss_forward)
+}
+
+
 def is_tensor(n, ip):
     return isinstance(ip, int) and 'Tensor' in n.input_types[ip]
 
@@ -40,20 +61,42 @@ def has_backward_parent(op):
 
 
 def is_backward(op):
-    return "autograd::engine::evaluate_function: " in op.name or "Optimizer" in op.name
+    return "autograd::engine::evaluate_function: " in op.name or \
+            "Optimizer" in op.name
 
 
 def is_backward_aten(op):
     return op.name.startswith("aten::") and \
-            (not op.children or op.name == "aten::convolution_backward") and \
+            not op.children and \
             has_backward_parent(op)
+
+
+def special_treatment(op):
+    if op.name in YES_OPS:
+        return True
+    elif op.name in NO_OPS:
+        return False
+    return None
+
+
+def is_qualified(op):
+    sp = special_treatment(op)
+    if sp is not None:
+        return sp
+    if op.get_parent_by_name(YES_OPS): # Discard all ops under any YES_OP
+        return False
+    return (is_backward_aten(op)) or (is_op(op) and not is_backward(op))
 
 
 def trace_handler(prof):
     # print(prof.key_averages().table(
     #     sort_by="self_cuda_time_total", row_limit=-1))
-    # prof.export_chrome_trace("/tmp/test_trace_" + str(prof.step_num) + ".json")
-    pass
+    prof.export_chrome_trace("/tmp/test_trace_" + str(prof.step_num) + ".json")
+
+def another_trace_handler(prof):
+    # print(prof.key_averages().table(
+    #     sort_by="self_cuda_time_total", row_limit=-1))
+    prof.export_chrome_trace("/tmp/test_trace_replay.json")
 
 
 def execution_graph_handler(output_file_name):
