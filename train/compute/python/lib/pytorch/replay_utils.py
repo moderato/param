@@ -1,7 +1,8 @@
 # N.B. Exgr utils required. Integration to Pytorch WIP.
 import torch
 from exec_graph_utils import NodeType
-import io, json
+from pprint import pprint
+import io, json, re
 
 
 # TODO: Add all torch dtypes to here
@@ -21,6 +22,7 @@ YES_OPS = {
     "aten::convolution_backward", # Not the lowest BW aten
     "aten::max_pool2d_with_indices_backward", # ...
     "aten::nll_loss_backward", # ...
+    "aten::native_dropout_backward", # ...
     "aten::_adaptive_avg_pool2d_backward", # ...
 
     "aten::max_pool2d_with_indices", # More outputs than its parent op
@@ -46,21 +48,15 @@ def is_op(node):
     return (node.type == NodeType.OPERATOR and (node.parent is not None and node.parent.type != NodeType.OPERATOR))
 
 
-def is_lowest_level_aten(op):
-    return op.name.startswith("aten::") and (
-        not op.children or op.name == "aten::addmm"
-    )
-
-
 def has_backward_parent(op):
-    if not op.parent or op.parent.id == op.id:
+    if not op.parent or op.parent.id == op.id: # Top op
         return False
-    if is_backward(op):
+    if is_backward_parent(op):
         return True
     return has_backward_parent(op.parent)
 
 
-def is_backward(op):
+def is_backward_parent(op):
     return "autograd::engine::evaluate_function: " in op.name or \
             "Optimizer" in op.name
 
@@ -85,7 +81,7 @@ def is_qualified(op):
         return sp
     if op.get_parent_by_name(YES_OPS): # Discard all ops under any YES_OP
         return False
-    return (is_backward_aten(op)) or (is_op(op) and not is_backward(op))
+    return (is_backward_aten(op)) or (is_op(op) and not is_backward_parent(op))
 
 
 def trace_handler(prof):
@@ -112,3 +108,39 @@ def execution_graph_handler(output_file_name):
                 found_root_node = True
 
     assert found_root_node
+
+
+def build_torchscript_func(n):
+    input_count = len(n.input_types)
+    output_count = len(n.output_types)
+
+    tmp = n.op_schema.split('->')
+    types = [item for item in tmp[0].split(' ') if ',' not in item]
+    types = [re.sub(r'\[[0-9]\]', '[]', t) for t in types][:-2] # e.g. int[2] -> int[]
+    input_types = [t if 'Tensor' not in t else 'Tensor' for t in types] # e.g. Tensor(float) -> Tensor
+    input_types[0] = re.sub(r'^.*?\(', '', input_types[0]) # Strip the op name
+    output_types = tmp[-1].lstrip(' (').rstrip(')').split(', ') # e.g. (Tensor, Tensor) -> [Tensor, Tensor]
+    output_types = [t if 'Tensor' not in t else 'Tensor' for t in output_types]
+
+    inputStr = """
+        graph({}):
+            {} = {}({})
+            {}
+            return (%output)
+    """.format(
+        ", ".join(["%{}: {}".format(idx, t) for idx, t in enumerate(input_types)]),
+        "%output: {}".format(output_types[0]) if output_count == 1 else \
+            ", ".join(["%{}: {}".format(idx + input_count, t) for idx, t in enumerate(output_types)]),
+        n.name,
+        ", ".join(["%{}".format(idx) for idx in range(input_count)]),
+        "%output : ({}) = prim::TupleConstruct({})".format(
+            ", ".join(["Tensor" for _ in range(output_count)]),
+            ", ".join(["%{}".format(idx + input_count) for idx in range(output_count)])
+        ) if output_count > 1 else "",
+    )
+    # print(inputStr)
+    # print("=============")
+    graph = torch._C.parse_ir(inputStr)
+    cu = torch._C.CompilationUnit()
+    func = cu.create_function(n.name, graph)
+    return func, output_count

@@ -29,5 +29,6 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+mkdir -p examples/pytorch/exgr_jsons
 python setup.py install
 python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net

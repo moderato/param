@@ -5,7 +5,6 @@ import os
 import sys
 import shutil
 import gc
-import re
 from collections import defaultdict
 
 # N.B. Exgr utils required. Integration to Pytorch WIP.
@@ -28,7 +27,7 @@ class ExgrReplayManager:
 
     def run_op(self, node):
         # print("-----")
-        # print(node.name, node.inputs, node.input_shapes)
+        # print(node.name, node.inputs, node.outputs)
         inputs = [
             self.tensor_registry[item] if is_tensor(node, idx) else \
             (
@@ -53,15 +52,19 @@ class ExgrReplayManager:
             if not is_tensor(node, idx):
                 continue
             # print(input_id, self.dependency[input_id])
-            self.dependency[input_id] -= 1
+            if input_id not in node.outputs:
+                self.dependency[input_id] -= 1
             # print(input_id, self.dependency[input_id])
             if self.dependency[input_id] == 0:
                 # print("delete tensor {}".format(input_id))
                 del self.tensor_registry[input_id]
+                del self.dependency[input_id]
         for output_id, output in zip(node.outputs, outputs):
             self.tensor_registry[output_id] = output
-        # print("Tensor registry")
-        # print(self.tensor_registry.keys())
+        # print("Tensor registry (count: {})".format(len(self.tensor_registry.keys())))
+        # pprint(self.tensor_registry.keys())
+        # print("Tensor dependency")
+        # pprint(self.dependency)
 
     def reset_registry(self):
         self.tensor_registry = {}
@@ -132,38 +135,7 @@ class ExgrReplayManager:
         # Build aten funcs
         self.funcs = {}
         for _, n in self.sorted_nodes:
-            input_count = len(n.input_types)
-            output_count = len(n.output_types)
-
-            tmp = n.op_schema.split('->')
-            types = [item for item in tmp[0].split(' ') if ',' not in item]
-            types = [re.sub(r'\[[0-9]\]', '[]', t) for t in types][:-2] # e.g. int[2] -> int[]
-            input_types = [t if 'Tensor' not in t else 'Tensor' for t in types] # e.g. Tensor(float) -> Tensor
-            input_types[0] = re.sub(r'^.*?\(', '', input_types[0]) # Strip the op name
-            output_types = tmp[-1].lstrip(' (').rstrip(')').split(', ')
-            output_types = [t if 'Tensor' not in t else 'Tensor' for t in output_types]
-
-            inputStr = """
-                graph({}):
-                    {} = {}({})
-                    {}
-                    return (%output)
-            """.format(
-                ", ".join(["%{}: {}".format(idx, t) for idx, t in enumerate(input_types)]),
-                "%output: {}".format(output_types[0]) if output_count == 1 else \
-                    ", ".join(["%{}: {}".format(idx + input_count, t) for idx, t in enumerate(output_types)]),
-                n.name,
-                ", ".join(["%{}".format(idx) for idx in range(input_count)]),
-                "%output : ({}) = prim::TupleConstruct({})".format(
-                    ", ".join(["Tensor" for _ in range(output_count)]),
-                    ", ".join(["%{}".format(idx + input_count) for idx in range(output_count)])
-                ) if output_count > 1 else "",
-            )
-            # print(inputStr)
-            # print("=============")
-            graph = torch._C.parse_ir(inputStr)
-            cu = torch._C.CompilationUnit()
-            func = cu.create_function(n.name, graph)
+            func, output_count = build_torchscript_func(n)
             self.funcs[n.id] = (func, output_count)
 
         # Reset
