@@ -25,84 +25,94 @@ class ExgrReplayManager:
         self.numWarmupIters = args.warmup
         self.numIters = args.iteration
 
-    def run_op(self, node):
-        # print("-----")
-        # print(node.name, node.inputs, node.outputs)
-        inputs = [
-            self.tensor_registry[item] if is_tensor(node, idx) else \
-            (
-                None if item == '<None>' else item
-            ) for idx, item in enumerate(node.inputs)
-        ]
-        # Workaround to eliminate the "strides() called on undefined Tensor" error
-        if node.name == "aten::convolution_backward":
-            inputs[-1] = [True, True, True]
+        # Permanent
+        self.root_node_name = args.subgraph
+        self.tensor_registry_permanent = {}
+        self.dependency_permanent = defaultdict(int)
+        self.sorted_nodes = []
+        self.funcs = {}
 
-        # print(node.name, node.id, [(type(i), i.shape if torch.is_tensor(i) else i, i.dtype if torch.is_tensor(i) else i) for i in inputs], type(node.outputs[0]))
-        func, output_count = self.funcs[node.id]
-        if output_count == 1:
-            outputs = (func(*inputs),)
-        else:
-            outputs = func(*inputs)
+        # Temporary
+        self.tensor_registry = {}
+        self.dependency = {}
 
-        # print("Dependency count")
-        # pprint(self.dependency)
-        for idx, input_id in enumerate(node.inputs):
-            # Only consider tensor id
-            if not is_tensor(node, idx):
-                continue
-            # print(input_id, self.dependency[input_id])
-            if input_id not in node.outputs:
-                self.dependency[input_id] -= 1
-            # print(input_id, self.dependency[input_id])
-            if self.dependency[input_id] == 0:
-                # print("delete tensor {}".format(input_id))
-                del self.tensor_registry[input_id]
-                del self.dependency[input_id]
-        for output_id, output in zip(node.outputs, outputs):
-            self.tensor_registry[output_id] = output
-        # print("Tensor registry (count: {})".format(len(self.tensor_registry.keys())))
-        # pprint(self.tensor_registry.keys())
-        # print("Tensor dependency")
-        # pprint(self.dependency)
 
     def reset_registry(self):
-        self.tensor_registry = {}
-        self.op_registry = {}
         self.dependency = self.dependency_permanent.copy()
         self.tensor_registry = {k: (v.cuda() if v is not None else None) for k, v in self.tensor_registry_permanent.items()}
         gc.collect()
         torch.cuda.empty_cache()
 
-    def preprocess_graph(self):
-        self.dependency_permanent = defaultdict(int)
-        self.tensor_registry_permanent = {}
+
+    def get_subgraph(self):
+        """
+            return: root node of the subgraph
+        """
         nodes = self.exgr.get_nodes(clean=True)
+        assert isinstance(self.root_node_name, str)
+        if self.root_node_name != "":
+            # Look up root nodes of subgraph by name
+            for _, n in nodes.items():
+                if n.name == self.root_node_name:
+                    return n
+        return nodes[1] # 1-base
 
-        # Filter modules, kernels, etc
-        # FW: Pytorch level ops (to prevent cases like aten::addmm having a sub op aten::expand (i.e. not the lowest level) that operates a tensor needed in the future)
-        # BW: All lowest aten ops
-        # Detail of exceptions in replay_utils.py
-        sorted_nodes = {
-            id: node for id, node in sorted(nodes.items(), key=lambda x: x[0]) if is_qualified(node)
-        }
-        redundant_node_ids = set()
-        for _, node in sorted_nodes.items():
-            redundant_node_ids.update([n.id for n in node.children])
-        self.sorted_nodes = [
-            (id, node) for id, node in sorted_nodes.items() if id not in redundant_node_ids
-        ]
-        # from pprint import pprint
-        # pprint([(id, node.name) for id, node in self.sorted_nodes])
-        # exit()
 
-        # Tensors dependency
-        for tid in self.exgr.tensors:
-            for _, n in self.sorted_nodes:
-                for idx, ip in enumerate(n.inputs):
-                    if tid == ip and is_tensor(n, idx):
-                        self.dependency_permanent[tid] += 1
+    def _dfs_traverse(self, node):
+        # moc: maximum output count
+        # peculiar: has more outputs than its parents
+        # processed: the whole subtree has been processed (ops taken or neglected)
+        def get_moc_and_peculiar(node, last_moc):
+            if len(node.outputs) > last_moc:
+                return len(node.outputs), True
+            return last_moc, False
 
+        def dfs(node, depth, moc, peculiar, processed):
+            # Update info of the current node
+            moc, peculiar = get_moc_and_peculiar(node, moc)
+            ret_peculiar, ret_processed = peculiar, processed
+            c_peculiars, c_processeds = [], []
+
+            # Search the subtree
+            for child in node.children:
+                c_peculiar, c_processed = dfs(child, depth+1, moc, peculiar, processed)
+                c_peculiars.append(c_peculiar)
+                c_processeds.append(c_processed)
+
+            next_level_has_peculiar = any(c_peculiars)
+            next_level_has_processed = any(c_processeds)
+            # Either there's a peculiar op or there's a processed subtree in the next level
+            # Example: aten::cross_entropy_loss
+            if next_level_has_peculiar or next_level_has_processed:
+                for idxc, c in enumerate(node.children):
+                    # Take this op if not processed
+                    if not c_processeds[idxc] and is_qualified(c):
+                        self.sorted_nodes.append((c.id, c))
+
+                        # Tensors dependency
+                        for idxi, ip in enumerate(c.inputs):
+                            if is_tensor(c, idxi):
+                                self.dependency_permanent[ip] += 1
+
+                        # Build aten funcs
+                        func, output_count = build_torchscript_func(c)
+                        self.funcs[c.id] = (func, output_count)
+
+                        # Mark as processed
+                        c_processeds[idxc] = True
+            
+            # Mark an op and its subtree as processed if all branches are processed
+            all_next_level_processed = len(c_processeds) != 0 and all(c_processeds)
+            if all_next_level_processed:
+                ret_processed = True
+
+            return ret_peculiar, ret_processed
+
+        dfs(node, 0, len(node.outputs), False, False)
+        self.sorted_nodes = [(id, node) for id, node in sorted(self.sorted_nodes, key=lambda x: x[0])]
+
+
+    def allocate_tensors(self):
         # Mark all intermediate tensors
         intermediate = set()
         input_set = set()
@@ -132,19 +142,73 @@ class ExgrReplayManager:
                     # except:
                     #     print(n.name, n.id, ip, n.input_shapes[idx])
 
-        # Build aten funcs
-        self.funcs = {}
-        for _, n in self.sorted_nodes:
-            func, output_count = build_torchscript_func(n)
-            self.funcs[n.id] = (func, output_count)
+
+    def preprocess_graph(self):
+        # Get the subgraph
+        root_node = self.get_subgraph()
+        self._dfs_traverse(root_node)
+
+        # Allocate
+        self.allocate_tensors()
 
         # Reset
         self.reset_registry()
 
 
+    def run_op(self, node):
+        # print("-----")
+        # print(node.name, node.inputs, node.outputs)
+        inputs = [
+            self.tensor_registry[item] if is_tensor(node, idx) else \
+            (
+                None if item == '<None>' else item
+            ) for idx, item in enumerate(node.inputs)
+        ]
+
+        ######
+        # Workaround to eliminate the "strides() called on undefined Tensor" error
+        if node.name == "aten::convolution_backward":
+            inputs[-1] = [True, True, True]
+        ######
+
+        # print(node.name, node.id, [(type(i), i.shape if torch.is_tensor(i) else i, i.dtype if torch.is_tensor(i) else i) for i in inputs], type(node.outputs[0]))
+        func, output_count = self.funcs[node.id]
+        if output_count == 1:
+            outputs = (func(*inputs),)
+        else:
+            outputs = func(*inputs)
+
+        # print("Dependency count")
+        # pprint(self.dependency)
+        for idx, input_id in enumerate(node.inputs):
+            # Only consider tensor id
+            if not is_tensor(node, idx):
+                continue
+            # print(input_id, self.dependency[input_id])
+            if input_id not in node.outputs:
+                self.dependency[input_id] -= 1
+            # print(input_id, self.dependency[input_id])
+            if self.dependency[input_id] == 0:
+                # print("delete tensor {}".format(input_id))
+                del self.tensor_registry[input_id]
+                del self.dependency[input_id]
+        for output_id, output in zip(node.outputs, outputs):
+            self.tensor_registry[output_id] = output
+        # print("Tensor registry (count: {})".format(len(self.tensor_registry.keys())))
+        # pprint(self.tensor_registry.keys())
+        # print("Tensor dependency")
+        # pprint(self.dependency)
+
+
     def benchTime(self):
         self.preprocess_graph()
         total_time = 0.0
+        # with torch.profiler.profile(
+        #     activities=[
+        #         torch.profiler.ProfilerActivity.CPU,
+        #         torch.profiler.ProfilerActivity.CUDA,
+        #     ],
+        # on_trace_ready=another_trace_handler) as p:
         for iter in range(self.numWarmupIters + self.numIters):
             event_1 = torch.cuda.Event(enable_timing=True)
             event_2 = torch.cuda.Event(enable_timing=True)
@@ -175,11 +239,11 @@ def main():
         help="File name prefix to write benchmark results.",
     )
     parser.add_argument(
-        "-o",
-        "--output-prefix",
+        "-g",
+        "--subgraph",
         type=str,
-        default="benchmark_result",
-        help="File name prefix to write benchmark results.",
+        default="",
+        help="Subgraph tag name.",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Increase log output verbosity."
@@ -220,6 +284,12 @@ def main():
                 optimizer.step()
 
             # Benchmark
+            # with torch.profiler.profile(
+            #     activities=[
+            #         torch.profiler.ProfilerActivity.CPU,
+            #         torch.profiler.ProfilerActivity.CUDA,
+            #     ],
+            #     on_trace_ready=trace_handler) as p:
             for _ in range(100):
                 event_1.record()
                 optimizer.zero_grad()
