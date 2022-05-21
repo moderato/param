@@ -1,6 +1,6 @@
 # N.B. Exgr utils required. Integration to Pytorch WIP.
 import torch
-from exec_graph_utils import NodeType
+from .exec_graph_utils import NodeType
 from pprint import pprint
 import io, json, re
 

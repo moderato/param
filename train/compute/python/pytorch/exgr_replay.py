@@ -8,7 +8,7 @@ import gc
 from collections import defaultdict
 
 # N.B. Exgr utils required. Integration to Pytorch WIP.
-from exec_graph_utils import ExecutionGraph
+from ..lib.pytorch.exec_graph_utils import ExecutionGraph
 
 import torch
 from ..lib import pytorch as lib_pytorch
@@ -100,7 +100,7 @@ class ExgrReplayManager:
 
                         # Mark as processed
                         c_processeds[idxc] = True
-            
+
             # Mark an op and its subtree as processed if all branches are processed
             all_next_level_processed = len(c_processeds) != 0 and all(c_processeds)
             if all_next_level_processed:
