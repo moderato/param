@@ -7,15 +7,15 @@ import shutil
 import gc
 from collections import defaultdict
 
-# N.B. Exgr utils required. Integration to Pytorch WIP.
-from exec_graph_utils import ExecutionGraph
-
 import torch
 from ..lib import pytorch as lib_pytorch
 from ..lib.init_helper import init_logging, load_modules
 from ..lib.pytorch.replay_utils import *
 from ..workloads import pytorch as workloads_pytorch
 from ..workloads.pytorch.alex_net import AlexNet
+
+# N.B. Exgr utils required. Integration to Pytorch WIP.
+from ..lib.pytorch.exec_graph_utils import ExecutionGraph
 
 
 class ExgrReplayManager:
@@ -81,8 +81,11 @@ class ExgrReplayManager:
 
             next_level_has_peculiar = any(c_peculiars)
             next_level_has_processed = any(c_processeds)
+
             # Either there's a peculiar op or there's a processed subtree in the next level
             # Example: aten::cross_entropy_loss
+
+            # print(node.id, node.name, next_level_has_peculiar, next_level_has_processed)
             if next_level_has_peculiar or next_level_has_processed:
                 for idxc, c in enumerate(node.children):
                     # Take this op if not processed
@@ -220,7 +223,10 @@ class ExgrReplayManager:
             if iter >= self.numWarmupIters:
                 total_time += event_1.elapsed_time(event_2)
             self.reset_registry()
-        print("Execution time: {:.2f} ms".format(total_time / self.numIters))
+        print("{} replay time: {:.2f} ms".format(
+            "Subgraph {}".format(self.root_node_name) if self.root_node_name != "" else "Workload",
+            total_time / self.numIters
+        ))
 
 
 def main():
@@ -318,11 +324,14 @@ def main():
                     # on_trace_ready=trace_handler,
                     on_execution_graph_ready=execution_graph_handler) as p:
                 for _ in range(10):
-                    optimizer.zero_grad()
-                    output = an(data)
-                    loss = criterion(output, target)
-                    loss.backward()
-                    optimizer.step()
+                    with torch.autograd.profiler.record_function("ZeroGrad"):
+                        optimizer.zero_grad()
+                    with torch.autograd.profiler.record_function("Forward"):
+                        output = an(data)
+                    with torch.autograd.profiler.record_function("Backward_WeightsUpdate"):
+                        loss = criterion(output, target)
+                        loss.backward()
+                        optimizer.step()
                     p.step()
                 exgr_output = torch.profiler.get_execution_graph_observer_output_file_name()
                 logger.info("Copy to exgr json to {}".format(exgr_json_path))
