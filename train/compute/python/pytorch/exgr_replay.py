@@ -81,8 +81,11 @@ class ExgrReplayManager:
 
             next_level_has_peculiar = any(c_peculiars)
             next_level_has_processed = any(c_processeds)
+
             # Either there's a peculiar op or there's a processed subtree in the next level
             # Example: aten::cross_entropy_loss
+
+            # print(node.id, node.name, next_level_has_peculiar, next_level_has_processed)
             if next_level_has_peculiar or next_level_has_processed:
                 for idxc, c in enumerate(node.children):
                     # Take this op if not processed
@@ -220,7 +223,10 @@ class ExgrReplayManager:
             if iter >= self.numWarmupIters:
                 total_time += event_1.elapsed_time(event_2)
             self.reset_registry()
-        print("Execution time: {:.2f} ms".format(total_time / self.numIters))
+        print("{} replay time: {:.2f} ms".format(
+            "Subgraph {}".format(self.root_node_name) if self.root_node_name != "" else "Workload",
+            total_time / self.numIters
+        ))
 
 
 def main():

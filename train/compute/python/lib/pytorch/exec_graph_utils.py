@@ -296,7 +296,7 @@ class ExecutionGraph:
             return self.clean_nodes
         return self.nodes
 
-    def get_unique_ops(self, detail: bool = False, clean: bool = False):
+    def get_unique_ops(self, detail: bool = False, clean: bool = False, json_format: bool = False):
         def get_param(value, type, shape):
             type = type.lower()
             SCALAR_TYPES = {"int", "long", "float", "double", "bool"}
