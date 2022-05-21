@@ -32,4 +32,4 @@
 mkdir -p examples/pytorch/exgr_jsons
 python setup.py install
 # rm examples/pytorch/exgr_jsons/alex_net.json
-python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100
+python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net_eg -w 10 -i 100 -g "[param|pytorch.model.alex_net|0|0|0|measure|forward_backward]"

@@ -262,73 +262,73 @@ def main():
     # Load PyTorch operator workloads.
     load_modules(workloads_pytorch)
 
-    exgr_json_path = "examples/pytorch/exgr_jsons/{}.json".format(args.model)
-    if not os.path.exists(exgr_json_path):
-        if args.model == "alex_net": # Default
-            batch_size = 2
-            an = AlexNet().cuda() # AlexNet
-            data = torch.randn([batch_size, 3, 224, 224]).cuda() # NCHW
-            optimizer = torch.optim.SGD(an.parameters(), lr=0.01)
-            criterion = torch.nn.CrossEntropyLoss().cuda()
-            target = torch.arange(1, batch_size + 1).long().cuda()
-            event_1 = torch.cuda.Event(enable_timing=True)
-            event_2 = torch.cuda.Event(enable_timing=True)
-            total_time = 0.0
+    exgr_json_path = "{}.json".format(args.model)
+    # if not os.path.exists(exgr_json_path):
+    #     if args.model == "alex_net": # Default
+    #         batch_size = 2
+    #         an = AlexNet().cuda() # AlexNet
+    #         data = torch.randn([batch_size, 3, 224, 224]).cuda() # NCHW
+    #         optimizer = torch.optim.SGD(an.parameters(), lr=0.01)
+    #         criterion = torch.nn.CrossEntropyLoss().cuda()
+    #         target = torch.arange(1, batch_size + 1).long().cuda()
+    #         event_1 = torch.cuda.Event(enable_timing=True)
+    #         event_2 = torch.cuda.Event(enable_timing=True)
+    #         total_time = 0.0
 
-            # Warmup
-            for _ in range(10):
-                optimizer.zero_grad()
-                output = an(data)
-                loss = criterion(output, target)
-                loss.backward()
-                optimizer.step()
+    #         # Warmup
+    #         for _ in range(10):
+    #             optimizer.zero_grad()
+    #             output = an(data)
+    #             loss = criterion(output, target)
+    #             loss.backward()
+    #             optimizer.step()
 
-            # Benchmark
-            # with torch.profiler.profile(
-            #     activities=[
-            #         torch.profiler.ProfilerActivity.CPU,
-            #         torch.profiler.ProfilerActivity.CUDA,
-            #     ],
-            #     on_trace_ready=trace_handler) as p:
-            for _ in range(100):
-                event_1.record()
-                optimizer.zero_grad()
-                output = an(data)
-                loss = criterion(output, target)
-                loss.backward()
-                optimizer.step()
-                event_2.record()
-                torch.cuda.synchronize()
-                total_time += event_1.elapsed_time(event_2) # In ms
-            print("Time per iteration: {} ms".format(total_time / 100))
+    #         # Benchmark
+    #         # with torch.profiler.profile(
+    #         #     activities=[
+    #         #         torch.profiler.ProfilerActivity.CPU,
+    #         #         torch.profiler.ProfilerActivity.CUDA,
+    #         #     ],
+    #         #     on_trace_ready=trace_handler) as p:
+    #         for _ in range(100):
+    #             event_1.record()
+    #             optimizer.zero_grad()
+    #             output = an(data)
+    #             loss = criterion(output, target)
+    #             loss.backward()
+    #             optimizer.step()
+    #             event_2.record()
+    #             torch.cuda.synchronize()
+    #             total_time += event_1.elapsed_time(event_2) # In ms
+    #         print("Time per iteration: {} ms".format(total_time / 100))
 
-            # Collect exgr
-            with torch.profiler.profile(
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                    ],
-                    schedule=torch.profiler.schedule(
-                        skip_first=3,
-                        wait=1,
-                        warmup=1,
-                        active=5,
-                        start_execution_graph=1,
-                        stop_execution_graph=2),
-                    # on_trace_ready=trace_handler,
-                    on_execution_graph_ready=execution_graph_handler) as p:
-                for _ in range(10):
-                    optimizer.zero_grad()
-                    output = an(data)
-                    loss = criterion(output, target)
-                    loss.backward()
-                    optimizer.step()
-                    p.step()
-                exgr_output = torch.profiler.get_execution_graph_observer_output_file_name()
-                logger.info("Copy to exgr json to {}".format(exgr_json_path))
-                shutil.copy(exgr_output, exgr_json_path)
-        else:
-            sys.error("Execution graph json file doesn't exist! Quit replay...")
+    #         # Collect exgr
+    #         with torch.profiler.profile(
+    #                 activities=[
+    #                     torch.profiler.ProfilerActivity.CPU,
+    #                     torch.profiler.ProfilerActivity.CUDA,
+    #                 ],
+    #                 schedule=torch.profiler.schedule(
+    #                     skip_first=3,
+    #                     wait=1,
+    #                     warmup=1,
+    #                     active=5,
+    #                     start_execution_graph=1,
+    #                     stop_execution_graph=2),
+    #                 # on_trace_ready=trace_handler,
+    #                 on_execution_graph_ready=execution_graph_handler) as p:
+    #             for _ in range(10):
+    #                 optimizer.zero_grad()
+    #                 output = an(data)
+    #                 loss = criterion(output, target)
+    #                 loss.backward()
+    #                 optimizer.step()
+    #                 p.step()
+    #             exgr_output = torch.profiler.get_execution_graph_observer_output_file_name()
+    #             logger.info("Copy to exgr json to {}".format(exgr_json_path))
+    #             shutil.copy(exgr_output, exgr_json_path)
+    #     else:
+    #         sys.error("Execution graph json file doesn't exist! Quit replay...")
 
     replay_manager = ExgrReplayManager(exgr_json_path, args)
     replay_manager.benchTime()
