@@ -24,6 +24,7 @@ class ExgrReplayManager:
             self.exgr = ExecutionGraph(json.load(f))
         self.numWarmupIters = args.warmup
         self.numIters = args.iteration
+        self.profile_replay = args.profile_replay
 
         # Permanent
         self.root_node_name = args.subgraph
@@ -206,27 +207,29 @@ class ExgrReplayManager:
     def benchTime(self):
         self.preprocess_graph()
         total_time = 0.0
-        # with torch.profiler.profile(
-        #     activities=[
-        #         torch.profiler.ProfilerActivity.CPU,
-        #         torch.profiler.ProfilerActivity.CUDA,
-        #     ],
-        # on_trace_ready=another_trace_handler) as p:
-        for iter in range(self.numWarmupIters + self.numIters):
-            event_1 = torch.cuda.Event(enable_timing=True)
-            event_2 = torch.cuda.Event(enable_timing=True)
-            event_1.record()
-            for _, node in self.sorted_nodes:
-                self.run_op(node)
-            event_2.record()
-            torch.cuda.synchronize()
-            if iter >= self.numWarmupIters:
-                total_time += event_1.elapsed_time(event_2)
-            self.reset_registry()
-        print("{} replay time: {:.2f} ms".format(
-            "Subgraph {}".format(self.root_node_name) if self.root_node_name != "" else "Workload",
-            total_time / self.numIters
-        ))
+        event_1 = torch.cuda.Event(enable_timing=True)
+        event_2 = torch.cuda.Event(enable_timing=True)
+        # N.B.: Use torch.autograd.profiler.profile instead of torch.profiler.profile for
+        #       enabling/disabling replay profiling.
+        with torch.autograd.profiler.profile(
+            self.profile_replay, use_cuda=True, use_kineto=True, record_shapes=False
+        ) as prof:
+            for iter in range(self.numWarmupIters + self.numIters):
+                event_1.record()
+                for _, node in self.sorted_nodes:
+                    self.run_op(node)
+                event_2.record()
+                torch.cuda.synchronize()
+                if iter >= self.numWarmupIters:
+                    total_time += event_1.elapsed_time(event_2)
+                self.reset_registry()
+            print("{} replay time{}: {:.2f} ms".format(
+                make_subgraph_text(self.root_node_name),
+                " (profiled)" if self.profile_replay else "",
+                total_time / self.numIters
+            ))
+        if self.profile_replay:
+            another_trace_handler(subgraph=self.root_node_name)(prof)
 
 
 def main():
@@ -250,6 +253,9 @@ def main():
         type=str,
         default="",
         help="Subgraph tag name.",
+    )
+    parser.add_argument(
+        "-p", "--profile-replay", action="store_true", help="Profile replay and get trace."
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Increase log output verbosity."

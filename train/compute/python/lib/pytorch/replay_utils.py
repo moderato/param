@@ -16,6 +16,10 @@ TORCH_DTYPES_RNG = {
 }
 
 
+def make_subgraph_text(text):
+    return "Subgraph {}".format(text) if text != "" else "Workload"
+
+
 def is_tensor(n, ip):
     return isinstance(ip, int) and 'Tensor' in n.input_types[ip]
 
@@ -51,10 +55,14 @@ def trace_handler(prof):
     #     sort_by="self_cuda_time_total", row_limit=-1))
     prof.export_chrome_trace("/tmp/test_trace_" + str(prof.step_num) + ".json")
 
-def another_trace_handler(prof):
-    # print(prof.key_averages().table(
-    #     sort_by="self_cuda_time_total", row_limit=-1))
-    prof.export_chrome_trace("/tmp/test_trace_replay.json")
+def another_trace_handler(subgraph=""):
+    def handle_fn(prof):
+        # print(prof.key_averages().table(
+        #     sort_by="self_cuda_time_total", row_limit=-1))
+        prof.export_chrome_trace("/tmp/test_trace_replay_{}.json".format(
+            make_subgraph_text(subgraph)
+        ))
+    return handle_fn
 
 
 def execution_graph_handler(output_file_name):
