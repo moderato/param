@@ -2,12 +2,14 @@ import argparse
 import json
 import logging
 import os
+import tempfile
 import sys
 import shutil
 import gc
 from collections import defaultdict
 
 import torch
+from torch.profiler import ExecutionGraphObserver
 from ..lib import pytorch as lib_pytorch
 from ..lib.init_helper import init_logging, load_modules
 from ..lib.pytorch.replay_utils import *
@@ -315,33 +317,23 @@ def main():
             print("Time per iteration: {} ms".format(total_time / 100))
 
             # Collect exgr
-            with torch.profiler.profile(
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                    ],
-                    schedule=torch.profiler.schedule(
-                        skip_first=3,
-                        wait=1,
-                        warmup=1,
-                        active=5,
-                        start_execution_graph=1,
-                        stop_execution_graph=2),
-                    # on_trace_ready=trace_handler,
-                    on_execution_graph_ready=execution_graph_handler) as p:
-                for _ in range(10):
-                    with torch.autograd.profiler.record_function("ZeroGrad"):
-                        optimizer.zero_grad()
-                    with torch.autograd.profiler.record_function("Forward"):
-                        output = an(data)
-                    with torch.autograd.profiler.record_function("Backward_WeightsUpdate"):
-                        loss = criterion(output, target)
-                        loss.backward()
-                        optimizer.step()
-                    p.step()
-                exgr_output = torch.profiler.get_execution_graph_observer_output_file_name()
-                logger.info("Copy to exgr json to {}".format(exgr_json_path))
-                shutil.copy(exgr_output, exgr_json_path)
+            fp = tempfile.NamedTemporaryFile('w+t', suffix='.json', delete=False)
+            fp.close()
+            eg = ExecutionGraphObserver()
+            eg.register_callback(fp.name)
+            eg.start()
+            with torch.autograd.profiler.record_function("ZeroGrad"):
+                optimizer.zero_grad()
+            with torch.autograd.profiler.record_function("Forward"):
+                output = an(data)
+            with torch.autograd.profiler.record_function("Backward_WeightsUpdate"):
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+            eg.stop()
+            eg.unregister_callback()
+            logger.info("Copy to exgr json to {}".format(exgr_json_path))
+            shutil.copy(fp.name, exgr_json_path)
         else:
             sys.error("Execution graph json file doesn't exist! Quit replay...")
 
