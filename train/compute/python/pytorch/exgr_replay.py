@@ -34,6 +34,7 @@ class ExgrReplayManager:
         self.dependency_permanent = defaultdict(int)
         self.sorted_nodes = []
         self.funcs = {}
+        self.verbose = args.verbose
 
         # Temporary
         self.tensor_registry = {}
@@ -89,8 +90,12 @@ class ExgrReplayManager:
 
         _dfs_traverse(root)
         self.sorted_nodes = [node for node in sorted(self.sorted_nodes, key=lambda x: x.id)]
-        # pprint([(n.id, n.name) for n in self.sorted_nodes])
-        # pprint(self.dependency_permanent)
+        if self.verbose:
+            logger.info("Sorted nodes:")
+            pprint([(n.id, n.name) for n in self.sorted_nodes])
+
+            logger.info("Tensor dependency:")
+            pprint(self.dependency_permanent)
 
 
     def allocate_tensors(self):
@@ -142,9 +147,6 @@ class ExgrReplayManager:
 
         # Allocate
         self.allocate_tensors()
-
-        # Reset
-        self.reset_registry()
 
 
     def run_op(self, node):
@@ -203,6 +205,7 @@ class ExgrReplayManager:
             self.profile_replay, use_cuda=True, use_kineto=True, record_shapes=False
         ) as prof:
             for iter in range(self.numWarmupIters + self.numIters):
+                self.reset_registry()
                 event_1.record()
                 for node in self.sorted_nodes:
                     self.run_op(node)
@@ -210,7 +213,6 @@ class ExgrReplayManager:
                 torch.cuda.synchronize()
                 if iter >= self.numWarmupIters:
                     total_time += event_1.elapsed_time(event_2)
-                self.reset_registry()
             print("{} replay time{}: {:.2f} ms".format(
                 make_subgraph_text(self.root_node_name),
                 " (profiled)" if self.profile_replay else "",
@@ -251,6 +253,7 @@ def main():
 
     args = parser.parse_args()
 
+    global logger
     if args.verbose:
         logger = init_logging(logging.DEBUG)
     else:
