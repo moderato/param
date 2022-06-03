@@ -21,7 +21,7 @@ NodeType = Enum("NodeType", "OPERATOR LABEL")
 
 
 # Label markers
-LABEL_MARKERS = ["##", "__", "module::", "DLRM ", "DistributedDataParallel", "Profiler"]
+LABEL_MARKERS = ["##", "__", "module::", "DLRM ", "DistributedDataParallel", "Profiler", "[pytorch|"]
 
 
 """

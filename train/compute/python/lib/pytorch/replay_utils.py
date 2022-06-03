@@ -6,6 +6,7 @@ import io, json, re
 
 # TODO: Add all torch dtypes to here
 TORCH_DTYPES_RNG = {
+    "bool": (torch.bool, torch.ones),
     "int8": (torch.int8, torch.ones),
     "half": (torch.half, torch.ones),
     "int": (torch.int, torch.ones),
@@ -17,15 +18,20 @@ TORCH_DTYPES_RNG = {
 
 
 def make_subgraph_text(text):
-    return "Subgraph {}".format(text) if text != "" else "Workload"
+    return "Subgraph {}".format(text.lstrip("module::")) if text != "" else "Workload"
 
 
 def is_tensor(n, ip):
     return isinstance(ip, int) and 'Tensor' in n.input_types[ip]
 
 
-def is_op(node):
-    return node.type == NodeType.OPERATOR # and (node.parent is not None and node.parent.type != NodeType.OPERATOR)
+def is_op(node, strict=False):
+    if not strict:
+        return node.type == NodeType.OPERATOR
+    return node.type == NodeType.OPERATOR and (
+                node.parent is not None and \
+                node.parent.type != NodeType.OPERATOR\
+            )
 
 
 def has_backward_parent(op):

@@ -47,6 +47,10 @@ class ExgrReplayManager:
         torch.cuda.empty_cache()
 
 
+    def is_tensor_registered(self, type, t_id):
+        return "Tensor" in type and t_id in self.dependency_permanent.keys()
+
+
     def get_subgraph(self):
         """
             return: root node of the subgraph
@@ -61,68 +65,39 @@ class ExgrReplayManager:
         return nodes[1] # 1-base
 
 
-    def _dfs_traverse(self, node):
-        # moc: maximum output count
-        # peculiar: has more outputs than its parents
-        # processed: the whole subtree has been processed (ops taken or neglected)
-        def get_moc_and_peculiar(node, last_moc):
-            if len(node.outputs) > last_moc:
-                return len(node.outputs), True
-            return last_moc, False
+    def extract_subgraph(self, root):
+        """
+            return: all nodes in the subgraph, in the order of node ID
+        """
+        def _dfs_traverse(root):
+            for child in root.children:
+                if (is_backward_aten(child)) or (is_op(child, strict=True) and not is_backward_parent(child)):
+                    self.sorted_nodes.append(child)
 
-        def dfs(node, depth, moc, peculiar, processed):
-            # Update info of the current node
-            moc, peculiar = get_moc_and_peculiar(node, moc)
-            ret_peculiar, ret_processed = peculiar, processed
-            c_peculiars, c_processeds = [], []
+                    # Tensors dependency
+                    ip_set = set() # Prevent identical inputs to be marked multiple times
+                    for idxi, ip in enumerate(child.inputs):
+                        if is_tensor(child, idxi) and ip not in ip_set:
+                            self.dependency_permanent[ip] += 1
+                            ip_set.add(ip)
 
-            # Search the subtree
-            for child in node.children:
-                c_peculiar, c_processed = dfs(child, depth+1, moc, peculiar, processed)
-                c_peculiars.append(c_peculiar)
-                c_processeds.append(c_processed)
+                    # Build aten funcs
+                    func, output_count = build_torchscript_func(child)
+                    self.funcs[child.id] = (func, output_count)
+                else:
+                    _dfs_traverse(child)
 
-            next_level_has_peculiar = any(c_peculiars)
-            next_level_has_processed = any(c_processeds)
-
-            # Either there's a peculiar op or there's a processed subtree in the next level
-            # Example: aten::cross_entropy_loss
-
-            # print(node.id, node.name, next_level_has_peculiar, next_level_has_processed)
-            if next_level_has_peculiar or next_level_has_processed:
-                for idxc, c in enumerate(node.children):
-                    # Take this op if not processed
-                    if not c_processeds[idxc] and is_qualified(c):
-                        self.sorted_nodes.append((c.id, c))
-
-                        # Tensors dependency
-                        for idxi, ip in enumerate(c.inputs):
-                            if is_tensor(c, idxi):
-                                self.dependency_permanent[ip] += 1
-
-                        # Build aten funcs
-                        func, output_count = build_torchscript_func(c)
-                        self.funcs[c.id] = (func, output_count)
-
-                        # Mark as processed
-                        c_processeds[idxc] = True
-            
-            # Mark an op and its subtree as processed if all branches are processed
-            all_next_level_processed = len(c_processeds) != 0 and all(c_processeds)
-            if all_next_level_processed:
-                ret_processed = True
-
-            return ret_peculiar, ret_processed
-
-        dfs(node, 0, len(node.outputs), False, False)
-        self.sorted_nodes = [(id, node) for id, node in sorted(self.sorted_nodes, key=lambda x: x[0])]
+        _dfs_traverse(root)
+        self.sorted_nodes = [node for node in sorted(self.sorted_nodes, key=lambda x: x.id)]
+        # pprint([(n.id, n.name) for n in self.sorted_nodes])
+        # pprint(self.dependency_permanent)
 
 
     def allocate_tensors(self):
         # Mark all intermediate tensors
         intermediate = set()
         input_set = set()
-        for _, n in self.sorted_nodes:
+        for n in self.sorted_nodes:
             for idx, ip in enumerate(n.inputs):
                 if is_tensor(n, idx) and ip in self.dependency_permanent.keys():
                     input_set.add(ip)
@@ -133,13 +108,24 @@ class ExgrReplayManager:
                         o not in input_set:
                     intermediate.add(o)
 
+        # Mark those tensors that occur first as an input to be instantiated later
+        instantiate = set()
+        output_set = set()
+        for n in self.sorted_nodes:
+            for (type, t_id, _) in n.get_input_tensors():
+                if self.is_tensor_registered(type, t_id) and t_id not in output_set:
+                    instantiate.add(t_id)
+
+            for (type, t_id, _) in n.get_output_tensors():
+                if self.is_tensor_registered(type, t_id):
+                    output_set.add(t_id)
+
         # Instantiation of tensors:
-        for _, n in self.sorted_nodes:
+        for n in self.sorted_nodes:
             for idx, ip in enumerate(n.inputs):
-                if is_tensor(n, idx) and \
+                if self.is_tensor_registered(n.input_types[idx], ip) and \
                         ip not in self.tensor_registry_permanent.keys() and \
-                        ip in self.dependency_permanent.keys() and \
-                        ip not in intermediate: # Only take the first size
+                        ip in instantiate: # Only take the first size
                     try:
                         dtype, rng = TORCH_DTYPES_RNG[n.input_types[idx].lstrip('Tensor(').rstrip(')')]
                         self.tensor_registry_permanent[ip] = rng(n.input_shapes[idx]).to(dtype)
@@ -152,7 +138,7 @@ class ExgrReplayManager:
     def preprocess_graph(self):
         # Get the subgraph
         root_node = self.get_subgraph()
-        self._dfs_traverse(root_node)
+        self.extract_subgraph(root_node)
 
         # Allocate
         self.allocate_tensors()
@@ -218,7 +204,7 @@ class ExgrReplayManager:
         ) as prof:
             for iter in range(self.numWarmupIters + self.numIters):
                 event_1.record()
-                for _, node in self.sorted_nodes:
+                for node in self.sorted_nodes:
                     self.run_op(node)
                 event_2.record()
                 torch.cuda.synchronize()
@@ -322,11 +308,11 @@ def main():
             eg = ExecutionGraphObserver()
             eg.register_callback(fp.name)
             eg.start()
-            with torch.autograd.profiler.record_function("ZeroGrad"):
+            with torch.autograd.profiler.record_function("module::ZeroGrad"):
                 optimizer.zero_grad()
-            with torch.autograd.profiler.record_function("Forward"):
+            with torch.autograd.profiler.record_function("module::Forward"):
                 output = an(data)
-            with torch.autograd.profiler.record_function("Backward_WeightsUpdate"):
+            with torch.autograd.profiler.record_function("module::Backward_WeightsUpdate"):
                 loss = criterion(output, target)
                 loss.backward()
                 optimizer.step()

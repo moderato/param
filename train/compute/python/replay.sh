@@ -34,6 +34,6 @@ python setup.py install
 rm examples/pytorch/exgr_jsons/alex_net.json
 python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100
 python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 -p
-python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph ZeroGrad
-python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph Forward
-python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph Backward_WeightsUpdate
+python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph "module::ZeroGrad"
+python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph "module::Forward"
+python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph "module::Backward_WeightsUpdate"
