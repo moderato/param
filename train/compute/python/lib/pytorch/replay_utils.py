@@ -21,8 +21,12 @@ def make_subgraph_text(text):
     return "Subgraph {}".format(text.lstrip("module::")) if text != "" else "Workload"
 
 
+def is_tensor_list(n, ip):
+    return isinstance(ip, int) and 'GenericList[Tensor' in n.input_types[ip]
+
+
 def is_tensor(n, ip):
-    return isinstance(ip, int) and 'Tensor' in n.input_types[ip]
+    return isinstance(ip, int) and 'Tensor' in n.input_types[ip] and 'GenericList' not in n.input_types[ip]
 
 
 def is_op(node, strict=False):
@@ -61,6 +65,7 @@ def trace_handler(prof):
     #     sort_by="self_cuda_time_total", row_limit=-1))
     prof.export_chrome_trace("/tmp/test_trace_" + str(prof.step_num) + ".json")
 
+
 def another_trace_handler(subgraph=""):
     def handle_fn(prof):
         # print(prof.key_averages().table(
@@ -82,7 +87,6 @@ def execution_graph_handler(output_file_name):
             assert "name" in n
             if "__ROOT_PROCESS__" in n["name"]:
                 found_root_node = True
-
     assert found_root_node
 
 
@@ -90,13 +94,17 @@ def build_torchscript_func(n):
     input_count = len(n.input_types)
     output_count = len(n.output_types)
 
-    tmp = n.op_schema.split('->')
-    types = [item for item in tmp[0].split(' ') if ',' not in item]
-    types = [re.sub(r'\[[0-9]\]', '[]', t) for t in types][:-2] # e.g. int[2] -> int[]
-    input_types = [t if 'Tensor' not in t else 'Tensor' for t in types] # e.g. Tensor(float) -> Tensor
-    input_types[0] = re.sub(r'^.*?\(', '', input_types[0]) # Strip the op name
-    output_types = tmp[-1].lstrip(' (').rstrip(')').split(', ') # e.g. (Tensor, Tensor) -> [Tensor, Tensor]
-    output_types = [t if 'Tensor' not in t else 'Tensor' for t in output_types]
+    tmp = n.op_schema.split(') -> ')
+    types = [item for item in tmp[0].split(' ') if ',' not in item][:-1]
+    # print(n.name, n.id, types)
+    types = [re.sub(r'\[[0-9]\]', '[]', t) for t in types] # e.g. int[2] -> int[]
+    # print(n.name, n.id, types)
+    input_types = ['Tensor' if 'Tensor(' in t else t for t in types if ('*)' not in t and '->' not in t)] # e.g. Tensor(float) -> Tensor; exception: aten::unbind(Tensor(a -> *) self, ...
+    # print(n.name, n.id, input_types)
+    input_types[0] = re.sub(r'^.*?\(', '', input_types[0]) # Strip the op name, e.g. aten::zeros(int[] -> int[]
+    # print(n.name, n.id, input_types)
+    output_types = tmp[-1].lstrip(' (').rstrip(')').split(', ') # e.g. "(Tensor, Tensor)" (str) -> [Tensor, Tensor] (list)
+    output_types = ['Tensor' if 'Tensor(' in t else t for t in output_types]
 
     inputStr = """
         graph({}):

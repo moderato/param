@@ -107,10 +107,10 @@ class Node:
         self.fw_parent_id: int = fw_parent_id
         self.scope: int = scope
         self.type: str = self.detect_type(name, inputs, outputs)
-        self.inputs: List[Any] = [tuple(i) if isinstance(i, list) else i for i in inputs]
+        self.inputs: List[Any] = inputs
         self.input_types: List[str] = input_types
         self.input_shapes: List[Any] = input_shapes
-        self.outputs: List[Any] = [tuple(o) if isinstance(o, list) else o for o in outputs]
+        self.outputs: List[Any] = outputs
         self.output_types: List[str] = output_types
         self.output_shapes: List[Any] = output_shapes
 
@@ -210,7 +210,7 @@ class Node:
         tensors = []
         for (type, input, shape) in param_list:
             if type.startswith("Tensor"):
-                tensors.append((type, input, shape))
+                tensors.append((type, tuple(input), shape))
             # GenericList could have tensor elements
             if type.startswith("GenericList"):
                 elem_type = type[12:-1].split(",")

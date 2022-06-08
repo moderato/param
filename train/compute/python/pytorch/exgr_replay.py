@@ -30,6 +30,7 @@ class ExgrReplayManager:
 
         # Permanent
         self.root_node_name = args.subgraph
+        self.skip_root_node_names = args.skip_subgraphs.split('-')
         self.tensor_registry_permanent = {}
         self.dependency_permanent = defaultdict(int)
         self.sorted_nodes = []
@@ -48,8 +49,8 @@ class ExgrReplayManager:
         torch.cuda.empty_cache()
 
 
-    def is_tensor_registered(self, type, t_id):
-        return "Tensor" in type and t_id in self.dependency_permanent.keys()
+    def is_tensor_registered(self, t_id):
+        return t_id in self.dependency_permanent.keys()
 
 
     def get_subgraph(self):
@@ -72,13 +73,15 @@ class ExgrReplayManager:
         """
         def _dfs_traverse(root):
             for child in root.children:
+                if child.name in self.skip_root_node_names:
+                    continue
                 if (is_backward_aten(child)) or (is_op(child, strict=True) and not is_backward_parent(child)):
                     self.sorted_nodes.append(child)
 
                     # Tensors dependency
                     ip_set = set() # Prevent identical inputs to be marked multiple times
-                    for idxi, ip in enumerate(child.inputs):
-                        if is_tensor(child, idxi) and ip not in ip_set:
+                    for _, ip, _ in child.get_input_tensors():
+                        if ip not in ip_set:
                             self.dependency_permanent[ip] += 1
                             ip_set.add(ip)
 
@@ -103,41 +106,45 @@ class ExgrReplayManager:
         intermediate = set()
         input_set = set()
         for n in self.sorted_nodes:
-            for idx, ip in enumerate(n.inputs):
-                if is_tensor(n, idx) and ip in self.dependency_permanent.keys():
-                    input_set.add(ip)
+            for _, t_id, _ in n.get_input_tensors():
+                if self.is_tensor_registered(t_id):
+                    input_set.add(t_id)
 
             # Tensors occurred as inputs before are not to be removed
-            for o in n.outputs:
-                if o in self.dependency_permanent and \
-                        o not in input_set:
-                    intermediate.add(o)
+            for _, t_id, _ in n.get_output_tensors():
+                if self.is_tensor_registered(t_id) and t_id not in input_set:
+                    intermediate.add(t_id)
 
         # Mark those tensors that occur first as an input to be instantiated later
         instantiate = set()
         output_set = set()
         for n in self.sorted_nodes:
-            for (type, t_id, _) in n.get_input_tensors():
-                if self.is_tensor_registered(type, t_id) and t_id not in output_set:
+            for (_, t_id, _) in n.get_input_tensors():
+                if self.is_tensor_registered(t_id) and t_id not in output_set:
                     instantiate.add(t_id)
 
-            for (type, t_id, _) in n.get_output_tensors():
-                if self.is_tensor_registered(type, t_id):
+            for (_, t_id, _) in n.get_output_tensors():
+                if self.is_tensor_registered(t_id):
                     output_set.add(t_id)
 
         # Instantiation of tensors:
         for n in self.sorted_nodes:
-            for idx, ip in enumerate(n.inputs):
-                if self.is_tensor_registered(n.input_types[idx], ip) and \
-                        ip not in self.tensor_registry_permanent.keys() and \
-                        ip in instantiate: # Only take the first size
+            for tp, t_id, shape in n.get_input_tensors():
+                # if t_id == (142, 135, 36, 36, 8):
+                #     print(n.name)
+                #     print(self.is_tensor_registered(t_id))
+                #     print(t_id not in self.tensor_registry_permanent.keys())
+                #     print(t_id in instantiate)
+                if self.is_tensor_registered(t_id) and \
+                        t_id not in self.tensor_registry_permanent.keys() and \
+                        t_id in instantiate: # Only take the first size
                     try:
-                        dtype, rng = TORCH_DTYPES_RNG[n.input_types[idx].lstrip('Tensor(').rstrip(')')]
-                        self.tensor_registry_permanent[ip] = rng(n.input_shapes[idx]).to(dtype)
+                        dtype, rng = TORCH_DTYPES_RNG[tp.lstrip('Tensor(').rstrip(')')]
+                        self.tensor_registry_permanent[t_id] = rng(shape).to(dtype)
                     except KeyError:
-                        self.tensor_registry_permanent[ip] = None
+                        self.tensor_registry_permanent[t_id] = None
                     # except:
-                    #     print(n.name, n.id, ip, n.input_shapes[idx])
+                    #     print(n.name, n.id, t_id, shape)
 
 
     def preprocess_graph(self):
@@ -151,11 +158,14 @@ class ExgrReplayManager:
 
     def run_op(self, node):
         # print("-----")
-        # print(node.name, node.inputs, node.outputs)
+        # print(node.name, node.id, node.inputs, node.outputs)
         inputs = [
-            self.tensor_registry[item] if is_tensor(node, idx) else \
+            self.tensor_registry[tuple(item)] if is_tensor(node, idx) else \
             (
-                None if item == '<None>' else item
+                [self.tensor_registry[tuple(id)] for id in item] if is_tensor_list(node, idx) else \
+                (
+                    None if item == '<None>' else item
+                )
             ) for idx, item in enumerate(node.inputs)
         ]
 
@@ -165,29 +175,37 @@ class ExgrReplayManager:
             inputs[-1] = [True, True, True]
         ######
 
-        # print(node.name, node.id, [(type(i), i.shape if torch.is_tensor(i) else i, i.dtype if torch.is_tensor(i) else i) for i in inputs], type(node.outputs[0]))
+        # print(node.name, node.id, [(type(i), i.shape if torch.is_tensor(i) else i, i.dtype if torch.is_tensor(i) else i) for i in inputs])
         func, output_count = self.funcs[node.id]
         if output_count == 1:
-            outputs = (func(*inputs),)
+            tmp = (func(*inputs),)
         else:
-            outputs = func(*inputs)
+            tmp = func(*inputs)
+        # Flatten any tensor lists
+        # TODO: Simplify this
+        outputs = []
+        for x in tmp:
+            if isinstance(x, list) and isinstance(x[0], torch.Tensor):
+                outputs.extend(x)
+            else:
+                outputs.append(x)
 
         # print("Dependency count")
         # pprint(self.dependency)
-        for idx, input_id in enumerate(node.inputs):
+        for tp, t_id, _ in node.get_input_tensors():
             # Only consider tensor id
-            if not is_tensor(node, idx):
+            if 'Tensor' not in tp:
                 continue
-            # print(input_id, self.dependency[input_id])
-            if input_id not in node.outputs:
-                self.dependency[input_id] -= 1
-            # print(input_id, self.dependency[input_id])
-            if self.dependency[input_id] == 0:
-                # print("delete tensor {}".format(input_id))
-                del self.tensor_registry[input_id]
-                del self.dependency[input_id]
-        for output_id, output in zip(node.outputs, outputs):
-            self.tensor_registry[output_id] = output
+            # print(t_id, self.dependency[t_id])
+            if t_id not in node.outputs:
+                self.dependency[t_id] -= 1
+            # print(t_id, self.dependency[t_id])
+            if self.dependency[t_id] == 0:
+                # print("delete tensor {}".format(t_id))
+                del self.tensor_registry[t_id]
+                del self.dependency[t_id]
+        for (_, t_id, _), output in zip(node.get_output_tensors(), outputs):
+            self.tensor_registry[t_id] = output
         # print("Tensor registry (count: {})".format(len(self.tensor_registry.keys())))
         # pprint(self.tensor_registry.keys())
         # print("Tensor dependency")
@@ -243,6 +261,13 @@ def main():
         type=str,
         default="",
         help="Subgraph tag name.",
+    )
+    parser.add_argument(
+        "-k",
+        "--skip-subgraphs",
+        type=str,
+        default="",
+        help="Tag names of subgraphs to be skipped",
     )
     parser.add_argument(
         "-p", "--profile-replay", action="store_true", help="Profile replay and get trace."
