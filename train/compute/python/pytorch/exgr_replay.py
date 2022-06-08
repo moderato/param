@@ -187,7 +187,7 @@ class ExgrReplayManager:
         for x in tmp:
             if isinstance(x, list) and isinstance(x[0], torch.Tensor):
                 outputs.extend(x)
-            else:
+            elif isinstance(x, torch.Tensor):
                 outputs.append(x)
 
         # print("Dependency count")
