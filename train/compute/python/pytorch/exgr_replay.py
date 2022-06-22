@@ -85,14 +85,15 @@ class ExgrReplayManager:
 
                     # Tensors dependency
                     ip_set = set() # Prevent identical inputs to be marked multiple times
-                    for _, ip, _ in child.get_input_tensors():
+                    for _, ip, _ in get_input_tensors(child):
                         if ip not in ip_set:
                             self.dependency_permanent[ip] += 1
                             ip_set.add(ip)
 
                     # Build aten funcs
-                    func, output_count = build_torchscript_func(child)
-                    self.funcs[child.id] = (func, output_count)
+                    func, output_count = build_func(child)
+                    if func is not None:
+                        self.funcs[child.id] = (func, output_count)
                 else:
                     _dfs_traverse(child)
 
@@ -106,17 +107,36 @@ class ExgrReplayManager:
             pprint(self.dependency_permanent)
 
 
+    def generate_tensor(self, n, instantiate: set):
+        if is_fbgemm(n):
+            input_args, _ = generate_fbgemm_tensors(n)
+        for idx, (tp, t_id, shape) in enumerate(get_input_tensors(n)):
+            if self.is_tensor_registered(t_id) and \
+                    t_id not in self.tensor_registry_permanent.keys() and \
+                    t_id in instantiate: # Only take the first size
+                try:
+                    if is_fbgemm(n):
+                        self.tensor_registry_permanent[t_id] = input_args[idx]
+                    else:
+                        dtype, rng = TORCH_DTYPES_RNG[tp.lstrip('Tensor(').rstrip(')')]
+                        self.tensor_registry_permanent[t_id] = rng(shape).to(dtype)
+                except KeyError:
+                    self.tensor_registry_permanent[t_id] = None
+                # except:
+                #     print(n.name, n.id, t_id, shape)
+
+
     def allocate_tensors(self):
         # Mark all intermediate tensors
         intermediate = set()
         input_set = set()
         for n in self.sorted_nodes:
-            for _, t_id, _ in n.get_input_tensors():
+            for _, t_id, _ in get_input_tensors(n):
                 if self.is_tensor_registered(t_id):
                     input_set.add(t_id)
 
             # Tensors occurred as inputs before are not to be removed
-            for _, t_id, _ in n.get_output_tensors():
+            for _, t_id, _ in get_output_tensors(n):
                 if self.is_tensor_registered(t_id) and t_id not in input_set:
                     intermediate.add(t_id)
 
@@ -124,32 +144,17 @@ class ExgrReplayManager:
         instantiate = set()
         output_set = set()
         for n in self.sorted_nodes:
-            for (_, t_id, _) in n.get_input_tensors():
+            for (_, t_id, _) in get_input_tensors(n):
                 if self.is_tensor_registered(t_id) and t_id not in output_set:
                     instantiate.add(t_id)
 
-            for (_, t_id, _) in n.get_output_tensors():
+            for (_, t_id, _) in get_output_tensors(n):
                 if self.is_tensor_registered(t_id):
                     output_set.add(t_id)
 
         # Instantiation of tensors:
         for n in self.sorted_nodes:
-            for tp, t_id, shape in n.get_input_tensors():
-                # if t_id == (142, 135, 36, 36, 8):
-                #     print(n.name)
-                #     print(self.is_tensor_registered(t_id))
-                #     print(t_id not in self.tensor_registry_permanent.keys())
-                #     print(t_id in instantiate)
-                if self.is_tensor_registered(t_id) and \
-                        t_id not in self.tensor_registry_permanent.keys() and \
-                        t_id in instantiate: # Only take the first size
-                    try:
-                        dtype, rng = TORCH_DTYPES_RNG[tp.lstrip('Tensor(').rstrip(')')]
-                        self.tensor_registry_permanent[t_id] = rng(shape).to(dtype)
-                    except KeyError:
-                        self.tensor_registry_permanent[t_id] = None
-                    # except:
-                    #     print(n.name, n.id, t_id, shape)
+            self.generate_tensor(n, instantiate)
 
 
     def preprocess_graph(self):
@@ -161,18 +166,29 @@ class ExgrReplayManager:
         self.allocate_tensors()
 
 
+    def get_inputs(self, node):
+        if is_fbgemm(node):
+            idx_list = fbgemm_input_args_indices(node)
+            inputs = [self.tensor_registry[tuple(node.inputs[idx])] for idx in idx_list]
+            if is_fbgemm_unweighted(node):
+                inputs.append(None)
+        else:
+            inputs = [
+                self.tensor_registry[tuple(item)] if is_tensor(node, idx) else \
+                (
+                    [self.tensor_registry[tuple(id)] for id in item] if is_tensor_list(node, idx) else \
+                    (
+                        None if item == '<None>' else item
+                    )
+                ) for idx, item in enumerate(node.inputs)
+            ]
+        return inputs
+
+
     def run_op(self, node):
         # print("-----")
         # print(node.name, node.id, node.inputs, node.outputs)
-        inputs = [
-            self.tensor_registry[tuple(item)] if is_tensor(node, idx) else \
-            (
-                [self.tensor_registry[tuple(id)] for id in item] if is_tensor_list(node, idx) else \
-                (
-                    None if item == '<None>' else item
-                )
-            ) for idx, item in enumerate(node.inputs)
-        ]
+        inputs = self.get_inputs(node)
 
         ######
         # Workaround to eliminate the "strides() called on undefined Tensor" error
@@ -197,7 +213,7 @@ class ExgrReplayManager:
 
         # print("Dependency count")
         # pprint(self.dependency)
-        for tp, t_id, _ in node.get_input_tensors():
+        for tp, t_id, _ in get_input_tensors(node):
             # Only consider tensor id
             if 'Tensor' not in tp:
                 continue
@@ -209,7 +225,7 @@ class ExgrReplayManager:
                 # print("delete tensor {}".format(t_id))
                 del self.tensor_registry[t_id]
                 del self.dependency[t_id]
-        for (_, t_id, _), output in zip(node.get_output_tensors(), outputs):
+        for (_, t_id, _), output in zip(get_output_tensors(node), outputs):
             self.tensor_registry[t_id] = output
         # print("Tensor registry (count: {})".format(len(self.tensor_registry.keys())))
         # pprint(self.tensor_registry.keys())
