@@ -37,3 +37,5 @@ python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10
 python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph "module::ZeroGrad"
 python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph "module::Forward"
 python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph "module::Backward_WeightsUpdate"
+
+python -m param_bench.train.compute.python.pytorch.exgr_replay -m dlrm_default -w 0 -i 1 # -p -k "module::get_batch_data-module::forward_pass::embedding_lookup"
