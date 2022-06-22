@@ -46,11 +46,11 @@ def main():
     run_options["pass_type"] = ExecutionPass.BACKWARD
 
     # Define config parameters required for input data generation and operator building.
-    num_tables = 1
-    rows = 228582
-    dim = 128
-    batch_size = 512
-    pooling_factor = 50
+    num_tables = 8
+    rows = [{"value": 1000000}] * num_tables
+    dim = [64] * num_tables
+    batch_size = 1024
+    pooling_factor = [{"value": 100}] * num_tables
     weighted = True
     weights_precision = "fp16"
     optimizer = "exact_row_wise_adagrad"
@@ -78,7 +78,7 @@ def main():
     # Construct and initialize the SplitTableBatchedEmbeddingBagsCodegen operator.
     op_config.op.build(
         num_tables,
-        rows,
+        [r['value'] for r in rows],
         dim,
         PoolingMode.SUM,
         weighted,
