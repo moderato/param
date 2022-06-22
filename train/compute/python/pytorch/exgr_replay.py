@@ -24,6 +24,7 @@ class ExgrReplayManager:
     def __init__(self, exgr, args):
         with open(exgr, 'r') as f:
             self.exgr = ExecutionGraph(json.load(f))
+        self.model_name = args.model
         self.numWarmupIters = args.warmup
         self.numIters = args.iteration
         self.profile_replay = args.profile_replay
@@ -47,6 +48,10 @@ class ExgrReplayManager:
         self.tensor_registry = {k: (v.cuda() if v is not None else None) for k, v in self.tensor_registry_permanent.items()}
         gc.collect()
         torch.cuda.empty_cache()
+
+
+    def make_subgraph_text(self):
+        return "subgraph {}".format(self.root_node_name.lstrip("module::")) if self.root_node_name != "" else self.model_name
 
 
     def is_tensor_registered(self, t_id):
@@ -75,7 +80,7 @@ class ExgrReplayManager:
             for child in root.children:
                 if child.name in self.skip_root_node_names:
                     continue
-                if (is_backward_aten(child)) or (is_op(child, strict=True) and not is_backward_parent(child)):
+                if is_qualified(child):
                     self.sorted_nodes.append(child)
 
                     # Tensors dependency
@@ -209,7 +214,7 @@ class ExgrReplayManager:
         # print("Tensor registry (count: {})".format(len(self.tensor_registry.keys())))
         # pprint(self.tensor_registry.keys())
         # print("Tensor dependency")
-        # pprint(self.dependency)
+        # pprint(self.dependency) # If the correctness holds, this line should prints an empty dict at its last execution.
 
 
     def benchTime(self):
@@ -232,12 +237,12 @@ class ExgrReplayManager:
                 if iter >= self.numWarmupIters:
                     total_time += event_1.elapsed_time(event_2)
             print("{} replay time{}: {:.2f} ms".format(
-                make_subgraph_text(self.root_node_name),
+                self.make_subgraph_text(),
                 " (profiled)" if self.profile_replay else "",
                 total_time / self.numIters
             ))
         if self.profile_replay:
-            another_trace_handler(subgraph=self.root_node_name)(prof)
+            another_trace_handler(text=self.make_subgraph_text())(prof)
 
 
 def main():
