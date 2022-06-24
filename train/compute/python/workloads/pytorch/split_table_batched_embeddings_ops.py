@@ -308,8 +308,13 @@ class SplitTableBatchedEmbeddingBagsCodegenOp(OperatorInterface):
     def create_grad(self):
         self.grad_in = torch.ones_like(self.fwd_out)
 
-    def backward(self):
-        self.fwd_out.backward(self.grad_in)
+    def backward(self, grad=None):
+        if grad is not None:
+            self.fwd_out.backward(grad)
+        else:
+            if self.grad_in is None:
+                self.create_grad()
+            self.fwd_out.backward(self.grad_in)
 
 
 register_operator(

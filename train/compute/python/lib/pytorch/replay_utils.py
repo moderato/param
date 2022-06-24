@@ -71,23 +71,33 @@ def fbgemm_input_args_indices(n):
     return idx_list
 
 
-def is_fbgemm(op):
+def is_fbgemm_forward(op):
     return 'fbgemm::split_embedding_codegen_lookup_' in op.name
 
 
-def is_fbgemm_unweighted(op):
-    return is_fbgemm(op) and len(fbgemm_input_args_indices(op)) == 2
+def is_fbgemm_forward_unweighted(op):
+    return is_fbgemm_forward(op) and len(fbgemm_input_args_indices(op)) == 2
+
+
+def is_fbgemm_backward(op):
+    return ('CppNode<SplitLookupFunction_' in op.name and not is_backward_parent(op))
+
+
+def is_fbgemm(op):
+    return is_fbgemm_forward(op) or is_fbgemm_backward(op)
 
 
 # TODO: Hopefully merge is_fbgemm and skip_op
 def skip_op(op):
     # Workaround: skip bounds check indices and other ops under embedding lookup module
-    return "bounds_check_indices" in op.name or \
-            ("fbgemm" not in op.name and op.parent is not None and "embedding_lookup" in op.parent.name)
+    return (not is_fbgemm_forward(op) and op.parent is not None and "embedding_lookup" in op.parent.name)
 
 
 def is_qualified(op):
-    return not skip_op(op) and (is_backward_aten(op) or (is_op(op, strict=True) and not is_backward_parent(op)))
+    return not skip_op(op) and \
+        (is_backward_aten(op) or \
+            is_fbgemm_backward(op) or \
+            (is_op(op, strict=True) and not is_backward_parent(op)))
 
 
 def trace_handler(prof):
@@ -119,7 +129,7 @@ def execution_graph_handler(output_file_name):
 
 
 def get_input_tensors(n):
-    if is_fbgemm(n):
+    if is_fbgemm_forward(n):
         idx_list = fbgemm_input_args_indices(n)
         return zip([n.input_types[x] for x in idx_list],
                     [tuple(n.inputs[x]) if isinstance(n.inputs[x], list) else n.inputs[x] for x in idx_list],
@@ -128,7 +138,7 @@ def get_input_tensors(n):
 
 
 def get_output_tensors(n):
-    if is_fbgemm(n):
+    if is_fbgemm_forward(n):
         return zip(n.output_types,
                     [tuple(x) for x in n.outputs],
                     n.output_shapes)
@@ -136,7 +146,7 @@ def get_output_tensors(n):
 
 
 def c10_type_to_str(t):
-    if t == "c10:Half":
+    if "c10::Half" in t:
         return "fp16"
     return "fp32"
     # raise ValueError("c10 type not supported!")
@@ -145,12 +155,6 @@ def c10_type_to_str(t):
 def get_optimizer_from_fbgemm_function_name(s):
     opt = s[39:].split("_")[0] # strip 'fbgemm::split_embedding_codegen_lookup_'
     return "exact_{}".format(opt) # Workaround, should be more accurate
-
-
-def build_func(n):
-    if is_fbgemm(n):
-        return build_fbgemm_func(n)
-    return build_torchscript_func(n)
 
 
 def get_fbgemm_info(n):
@@ -185,8 +189,7 @@ def build_fbgemm_func(n):
         weights_precision,
         optimizer,
     )
-
-    return op_config.op.forward, len(n.outputs)
+    return op_config.op, len(n.outputs)
 
 
 def generate_fbgemm_tensors(n):
@@ -220,8 +223,10 @@ def generate_fbgemm_tensors(n):
     (input_args, input_kwargs) = input_data_gen.get_data(
         data_generator_config, run_options["device"]
     )
+    if is_fbgemm_forward_unweighted(n):
+        input_args.pop(-1)
 
-    return input_args[:len(fbgemm_input_args_indices(n))], input_kwargs # Discard weights if not needed
+    return input_args, input_kwargs # Discard weights if not needed
 
 
 def build_torchscript_func(n):
