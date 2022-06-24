@@ -37,6 +37,7 @@ class ExgrReplayManager:
         self.sorted_nodes = []
         self.funcs = {}
         self.verbose = args.verbose
+        self.fbgemm_backward_ops = []
 
         # Temporary
         self.tensor_registry = {}
@@ -72,6 +73,17 @@ class ExgrReplayManager:
         return nodes[1] # 1-base
 
 
+    def build_func(self, n):
+        if is_fbgemm_forward(n):
+            func, output_count = build_fbgemm_func(n)
+            self.fbgemm_backward_ops.append(func.backward)
+            return func.forward, output_count
+        elif is_fbgemm_backward(n):
+            assert self.fbgemm_backward_ops
+            return self.fbgemm_backward_ops.pop(-1), len(n.output_types)
+        return build_torchscript_func(n)
+
+
     def extract_subgraph(self, root):
         """
             return: all nodes in the subgraph, in the order of node ID
@@ -91,9 +103,8 @@ class ExgrReplayManager:
                             ip_set.add(ip)
 
                     # Build aten funcs
-                    func, output_count = build_func(child)
-                    if func is not None:
-                        self.funcs[child.id] = (func, output_count)
+                    func, output_count = self.build_func(child)
+                    self.funcs[child.id] = (func, output_count)
                 else:
                     _dfs_traverse(child)
 
@@ -108,14 +119,14 @@ class ExgrReplayManager:
 
 
     def generate_tensor(self, n, instantiate: set):
-        if is_fbgemm(n):
+        if is_fbgemm_forward(n):
             input_args, _ = generate_fbgemm_tensors(n)
         for idx, (tp, t_id, shape) in enumerate(get_input_tensors(n)):
             if self.is_tensor_registered(t_id) and \
                     t_id not in self.tensor_registry_permanent.keys() and \
                     t_id in instantiate: # Only take the first size
                 try:
-                    if is_fbgemm(n):
+                    if is_fbgemm_forward(n):
                         self.tensor_registry_permanent[t_id] = input_args[idx]
                     else:
                         dtype, rng = TORCH_DTYPES_RNG[tp.lstrip('Tensor(').rstrip(')')]
@@ -167,10 +178,10 @@ class ExgrReplayManager:
 
 
     def get_inputs(self, node):
-        if is_fbgemm(node):
+        if is_fbgemm_forward(node):
             idx_list = fbgemm_input_args_indices(node)
             inputs = [self.tensor_registry[tuple(node.inputs[idx])] for idx in idx_list]
-            if is_fbgemm_unweighted(node):
+            if is_fbgemm_forward_unweighted(node):
                 inputs.append(None)
         else:
             inputs = [
@@ -198,18 +209,21 @@ class ExgrReplayManager:
 
         # print(node.name, node.id, [(type(i), i.shape if torch.is_tensor(i) else i, i.dtype if torch.is_tensor(i) else i) for i in inputs])
         func, output_count = self.funcs[node.id]
-        if output_count == 1:
-            tmp = (func(*inputs),)
-        else:
-            tmp = func(*inputs)
-        # Flatten any tensor lists
-        # TODO: Simplify this
         outputs = []
-        for x in tmp:
-            if isinstance(x, list) and isinstance(x[0], torch.Tensor):
-                outputs.extend(x)
-            elif isinstance(x, torch.Tensor):
-                outputs.append(x)
+        if output_count == 0:
+            func(*inputs)
+        else:
+            if output_count == 1:
+                tmp = (func(*inputs),)
+            else:
+                tmp = func(*inputs)
+            # Flatten any tensor lists
+            # TODO: Simplify this
+            for x in tmp:
+                if isinstance(x, list) and isinstance(x[0], torch.Tensor):
+                    outputs.extend(x)
+                elif isinstance(x, torch.Tensor):
+                    outputs.append(x)
 
         # print("Dependency count")
         # pprint(self.dependency)

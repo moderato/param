@@ -31,6 +31,8 @@
 
 mkdir -p examples/pytorch/exgr_jsons
 python setup.py install
+
+# AlexNet
 rm examples/pytorch/exgr_jsons/alex_net.json
 python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 # -v
 python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 -p
@@ -38,4 +40,9 @@ python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10
 python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph "module::Forward"
 python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph "module::Backward_WeightsUpdate"
 
-python -m param_bench.train.compute.python.pytorch.exgr_replay -m dlrm_default -w 0 -i 1 # -p -k "module::get_batch_data-module::forward_pass::embedding_lookup"
+# DLRM default (batch_size = 1024)
+# Ref time on V100: ~5.6 ms
+# Bottom MLP: 512-512-64
+# Top MLP: 1024-1024-1024-1
+# Embedding lookup: 1000000 rows * 8 tables, D = 64, L = 100
+python -m param_bench.train.compute.python.pytorch.exgr_replay -m dlrm_default_1024 -w 10 -i 100 -k "module::get_batch_data"
