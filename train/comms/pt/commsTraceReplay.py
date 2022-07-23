@@ -16,12 +16,33 @@ from typing import Dict, List, Set
 
 import comms_utils
 import numpy as np
-from comms_utils import paramCommsBench, paramTimer, paramProfile, paramToCommName
+import torch
+from comms_utils import (
+    comms_world_info_holder,
+    commsParamsHolderBase,
+    paramCommsBench,
+    paramProfile,
+    paramTimer,
+    paramToCommName,
+)
 
 logger = logging.getLogger(__name__)
 
+# sleep for 20ms to wait for next collective
+LOOP_TIMER_S = .02
 
-def writeCommDetails(commsTracePerf, rank, folder="./"):
+def writeCommDetails(commsTracePerf: List, rank: int, folder: str ="./") -> None:
+    """
+    Writes the replayed comm details of the current rank.
+
+    Args:
+        commsTracePerf: List that contains the metrics of each replayed collective in the current rank.
+        rank: The current rank that the comm details will be written for.
+        folder: Directory path to where the comm details for all ranks will be written.
+                                If none, no output will be written.
+    Returns:
+        None
+    """
     if len(folder) == 0:
         # skip output if the path is explicitly set to ""
         return
@@ -29,7 +50,7 @@ def writeCommDetails(commsTracePerf, rank, folder="./"):
     logger.info(f"[Rank {rank:3}] Writing comms details to {comms_file}")
 
     saveToLocal = True
-    if "://" in comms_file:
+    if "://" in comms_file: # assume that "://" in directory path means remote store
         saveToLocal = False
         try:
             from internals import writeRemoteTrace as writeFbRemoteTrace
@@ -54,6 +75,13 @@ def writeCommDetails(commsTracePerf, rank, folder="./"):
 
 
 class commsTraceReplayBench(paramCommsBench):
+    """
+    A class to replay and benchmark generated traces for collective communications.
+
+    This class will read a provided trace and replay it based on runtime parameters specified in the command line.
+    At the end of a replay, the benchmarks for the run will be recorded in different JSON files in the specified out_path, if provided.
+    The goal of this class is to help scale AI training optimizations by studying the behaviours of AI backends.
+    """
     def __init__(self):
         super().__init__(supportedNwstacks=["pytorch-dist", "pytorch-xla-tpu"])
         self.comms_trace = {}
@@ -68,6 +96,7 @@ class commsTraceReplayBench(paramCommsBench):
         self.allowList = ""
         self.out_path = "/tmp/paramReplayedTrace"
         self.colls_per_batch = -1
+        self.use_timestamp = False
 
         self.collInMsgSizes: Dict[str, List] = {}
         self.collInUniMsgSizes: Dict[str, Set] = {}
@@ -80,21 +109,22 @@ class commsTraceReplayBench(paramCommsBench):
         self.comms_blocks: Dict[str, List] = {}
         self.traceWithPerf = []
         self.blockStack = []
+
+        # for blocking collectives this is the sum of all the collective latencies
+        # for nonblocking collectives this is the sum of how long each collective took to be sent to the device
         self.totalCommsLatency = 0.0
+        # how long it took to finish all collectives in the trace
+        self.totalTraceLatency = 0.0
 
-        import torch
+    def readArgs(self, parser: argparse.ArgumentParser) -> None:
+        """
+        Reads command line args to set runtime parameters for replay.
 
-        self.strToTorchDtype = {
-            "Byte": torch.uint8,
-            "Float": torch.float32,
-            "Int": torch.int32,
-            "Long": torch.long,
-            "Double": torch.double,
-            "Half": torch.half,
-            "Bool": torch.bool
-        }
-
-    def readArgs(self, parser):
+        Args:
+            parser: ArgumentParser that will handle parsing command line arguments.
+        Returns:
+            Namespace containing a collection of parser arguments.
+        """
         # read the common/basic arguments
         super().readArgs(parser)
         parser.add_argument(
@@ -154,9 +184,23 @@ class commsTraceReplayBench(paramCommsBench):
             default=self.colls_per_batch,
             help="Toggle to set number of consecutive collectives in a batch. This also enables per batch latency stats.",
         )
+        parser.add_argument(
+           "--use_timestamp",
+            action="store_true",
+            default=self.use_timestamp,
+            help="Toggle to use time-based replay.",
+        )
         return parser.parse_args()
 
-    def checkArgs(self, args):
+    def checkArgs(self, args: argparse.Namespace) -> None:
+        """
+        Validates command line args, will raise an error and gracefully exit if an invalid command line arg is found.
+
+        Args:
+            args: Namespace containing collection of args to validate.
+        Returns:
+            None
+        """
         super().checkArgs(args)
 
         if (not self.use_remote_trace) and (
@@ -164,11 +208,20 @@ class commsTraceReplayBench(paramCommsBench):
             or path.isfile(self.trace_file) is False
         ):
             raise ValueError(
-                f"Trace file {self.trace_file} not exist or not a file! Please specifiy the correct path using --trace-path"
+                f"Trace file {self.trace_file} does not exist or is not a file! Please specify the correct path by using --trace-path."
             )
             comms_utils.gracefulExit()
 
-    def reportBenchTime(self, commsParams):
+    def reportBenchTime(self):
+        """
+        Prints replay benchmarks for current rank. This should only be called after setBench() and benchTime()
+        to ensure that replay statistics are available to read.
+
+        Args:
+            None
+        Returns:
+            None
+        """
         # TODO:
         #   1) dry run: output some statistics, e.g., # of msgs, distribtuion of sizes (max, min, avg, p50, p95...ect)
         #   2) normal run: output 1) as well as perf. breakdown (e.g., a2a latencies at different phase, some percentages...ect)
@@ -229,6 +282,13 @@ class commsTraceReplayBench(paramCommsBench):
 
         if not self.is_dry_run:
             print("\n{} Performance of replayed comms {}".format("=" * 20, "=" * 20))
+            print(
+                "{}\n Total latency (us) of comms in trace {}: \n{}".format(
+                    "-" * 50,
+                    self.totalTraceLatency,
+                    "-" * 50,
+                )
+            )
             for (coll, lats) in self.collLat.items():
                 if len(lats) == 0:
                     continue
@@ -284,6 +344,15 @@ class commsTraceReplayBench(paramCommsBench):
                 )
 
     def initTraceStat(self):
+        """
+        Do a first pass on the trace to gather statistics on msg count, msg sizes,
+        and record how many collectives each block has.
+
+        Args:
+            None
+        Returns:
+            None
+        """
         maxInMsgsize = 0
         maxOutMsgsize = 0
         self.num_msg = len(self.comms_trace)
@@ -329,14 +398,31 @@ class commsTraceReplayBench(paramCommsBench):
                             }
                         )
 
-    def prepComms(self, curComm, commsParams):
+    def prepComms(self, curComm: Dict, commsParams: commsParamsHolderBase) -> (torch.Tensor, torch.Tensor):
+        """
+        Prepares the appropriate tensors for the current collective communication.
+
+        Args:
+            curComm: The current communication that we are preparing the correct tensor for.
+            commsParams: Holds the comms param arguments that will determine tensor attributes.
+        Returns:
+            (ipTensor, opTensor) if the current communication requires tensors, None otherwise.
+        """
         commOp = paramToCommName(curComm["comms"])
         if commOp in ("wait", "barrier"):
             return ([], [])
 
+        # prep process group for hard-coded traces
+        if "pg_id" in curComm and not self.shrink:
+            self.collectiveArgs.group = self.collectiveArgs.groups[curComm["pg_id"]]
+            self.collectiveArgs.world_size = curComm["world_size"] # match world size to the size of the current PG
+        else: # use default process group if no pg_id is provided or shrink is enabled
+            self.collectiveArgs.group = self.backendFuncs.get_default_group()
+
         # for all_to_allv, we can shrink the size if running on smaller scale
         # this is for sanity test or debug purpose only since we don't always get to run very large scale
         if self.shrink:
+
             cur_world_size = self.collectiveArgs.world_size
             real_world_size = cur_world_size
 
@@ -382,21 +468,30 @@ class commsTraceReplayBench(paramCommsBench):
                 f"shrink message sizes to curInNumElem {curComm['in_msg_size']}, curOutNumElem {curComm['out_msg_size']}"
             )
 
-        commsParams.dtype = self.strToTorchDtype[curComm["dtype"]]
+        commsParams.dtype = self.dtypeMap[curComm["dtype"]]
         # allocate and return tensors
         return super().prepComm(curComm, commsParams)
 
-    def warmUpBench(self, commsParams):
+    def warmUpBench(self, commsParams: commsParamsHolderBase) -> None:
+        """
+        Replays collectives without recording statistics to warm up devices.
+
+        Args:
+            commsParams: Holds comms params to be passed into prepComms() for appropriate tensor allocation.
+        Returns:
+            None
+        """
         for cnt, curComm in enumerate(self.comms_trace[: self.max_msg_cnt]):
             commEntry = curComm.copy()
-            if commEntry["comms"] not in self.allowList:
+            commName = paramToCommName(commEntry["comms"])
+            if commName not in self.allowList:
                 continue
             if self.backendFuncs.get_global_rank() == 0:
                 logger.debug(
                     f"[Rank {self.collectiveArgs.global_rank:3}] Replaying \n{str(commEntry)}\n"
                 )
                 print(
-                    f"[Warm-up][{cnt} / {self.max_msg_cnt}] Replaying {commEntry['comms']:>10}...",
+                    f"[Warm-up][{cnt} / {self.max_msg_cnt}] Replaying {commName:>10}...",
                     end="\r",
                 )
 
@@ -406,31 +501,52 @@ class commsTraceReplayBench(paramCommsBench):
                 self.collectiveArgs.opTensor,
             ) = self.prepComms(commEntry, commsParams)
 
-            if commEntry["comms"] in self.backendFuncs.collectiveFunc.keys():
-                self.backendFuncs.collectiveFunc[commEntry["comms"]](self.collectiveArgs)
+            if commName in self.backendFuncs.collectiveFunc.keys():
+                self.backendFuncs.collectiveFunc[commName](self.collectiveArgs)
             # skip not supported ops
 
             self.backendFuncs.complete_accel_ops(self.collectiveArgs)
 
-    def runComms(self, collName, curBlockStack):
+    def runComms(self, collName: str, curComm: Dict, curBlockStack: str) -> (float, float):
+        """
+        Replays collective communication operation and records metrics for benchmarking.
+
+        Args:
+            collName: Name of collective that is going to be replayed.
+            curComm: dict containing information on the current collective.
+            curBlockStack: str containg the marker_stack(s) that this collective is a part of
+        Returns:
+            (latency, global_latency), returns the timings of how long the replay or posting (if nonblocking) of the collective took.
+        """
         self.collectiveArgs.quant_time.reset()
         self.collectiveArgs.dequant_time.reset()
         collTimer = paramTimer()
 
         if self.is_blocking:
             self.backendFuncs.sync_barrier(self.collectiveArgs)
+
         # replay the collective
         with paramProfile(
             timer=collTimer, description="# PARAM replay: " + curBlockStack
         ):
             if collName in self.backendFuncs.collectiveFunc.keys():
-                self.backendFuncs.collectiveFunc[collName](
+                # record collectiveID for wait ops
+                if "req" in curComm:
+                    self.collectiveArgs.collectiveId = curComm["req"]
+
+                retObj = self.backendFuncs.collectiveFunc[collName](
                     self.collectiveArgs, retFlag=True
                 )
             # skip not supported ops
 
-            if self.is_blocking:
-                self.backendFuncs.complete_accel_ops(self.collectiveArgs)
+            # if blocking, post outstanding ops and wait for them to complete. if nonblocking, just post op
+            self.backendFuncs.complete_accel_ops(self.collectiveArgs, devSync=self.is_blocking)
+
+            # if nonblocking, then store the pair {reqID, future} so that we can wait on it later
+            # check if req id is recorded in trace for backwards compatibility
+            if "req" in curComm and not self.is_blocking and collName != "wait":
+                self.collectiveArgs.waitObjIds[curComm["req"]] = retObj
+
 
         # For non-blocking, latency and global_latency are the same
         global_latency = latency = collTimer.getTimeUS()
@@ -446,34 +562,58 @@ class commsTraceReplayBench(paramCommsBench):
 
         return (latency, global_latency)
 
-    def benchTime(self, commsParams):
+
+    def benchTime(self, commsParams: commsParamsHolderBase) -> None:
         """
+        Run all collectives in current rank and record timing metrics for benchmarkng.
+
         The json format is expecting to be either
         {
+            "startTime_ns": 0
+            "timestamp": 12345
             "marker_stack": ["## all2all ##"]
             "comms": "all_to_allv",
+            "seqnum": 0
+            "req": 0
             "in_msg_size": 10357149,
             "out_msg_size": 23093760,
             "in_split": [],
             "out_split": [],
-            "dtype": "Int"
+            "dtype": Int
+            "world_size": 16
         },
         or w/o in/out_split
         {
+            "startTime_ns": 0
+            "timestamp": 12345
             "marker_stack": ["## all2all ##"]
             "comms": "all_reduce",
+            "seqnum": 0
+            "req": 0
             "in_msg_size": 1048576,
             "out_msg_size": 1048576,
-            "dtype": "Int"
+            "dtype": Int,
+            "world_size": 16
         }
         or wait/barrier
         {
+            "startTime_ns": 0
+            "timestamp": 12345
             "marker_stack": ["## all2all ##"]
+            "seqnum": 0
+            "req": 0
             "comms": "wait",
+            "world_size": 16
         }
         NOTE:
             - this format is subject to be changed anytime
             - the unit of all size fields is # of elements (not bytes)
+
+        Args:
+            commsParams: Holds comms params to pass into prepComms() to aqcuire appropriate tensors
+                                                 and perform data validation in blocking runs.
+        Returns:
+            None
         """
         # warm-up
         if self.do_warm_up:
@@ -490,6 +630,7 @@ class commsTraceReplayBench(paramCommsBench):
                 logger.info(f"\t{coll}: {len(sizes)}")
 
         coll_in_batch_num = 0
+        startTime = time.monotonic_ns()
         for cnt, curComm in enumerate(self.comms_trace[: self.max_msg_cnt]):
             collName = paramToCommName(curComm["comms"])
             if collName not in self.allowList:
@@ -515,7 +656,23 @@ class commsTraceReplayBench(paramCommsBench):
             if self.colls_per_batch > 0 and coll_in_batch_num == 0:
                 batch_begin = time.monotonic()
 
-            (latency, global_latency) = self.runComms(collName, curBlockStack)
+            # sleep for until it is time for the next collective to run
+            # if the collective is less than LOOP_TIMER_S (.02s) away, continue looping for the duration. This is because of time.sleep()'s accuracy.
+            if self.use_timestamp:
+                if "startTime_ns" in curComm: # for backwards compatibility
+                    while(time.monotonic_ns() - startTime <= curComm["startTime_ns"]):
+                        timeDiff = curComm["startTime_ns"] - (time.monotonic_ns() - startTime)
+                        if(timeDiff/1e9 >= LOOP_TIMER_S): # make it seconds
+                            time.sleep(LOOP_TIMER_S)
+
+            # send comm request to pytorch backend
+            (latency, global_latency) = self.runComms(collName, curComm, curBlockStack)
+
+            # perform data validation check on the final opTensor
+            if self.is_blocking and commsParams.dcheck == 1 and collName not in ("wait","barrier"):
+                commsParams.collective = collName
+                commsParams.srcOrDst = curComm["root"] if "root" in curComm else 0
+                self.dcheck(commsParams, curComm["out_msg_size"], self.collectiveArgs.opTensor)
 
             # calculating batch latency (batch defined by --colls-per-batch)
             if collName == "wait" and self.colls_per_batch > 0:
@@ -527,43 +684,52 @@ class commsTraceReplayBench(paramCommsBench):
                     coll_in_batch_num = 0
                     self.batchLat.append(batch_latency)
 
-            # perfom data validation check on the final opTensor
-            if self.is_blocking and commsParams.dcheck == 1 and collName not in ("wait","barrier"):
-                commsParams.collective = collName
-                commsParams.srcOrDst = curComm["root"] if "root" in curComm else 0
-                self.dcheck(commsParams, curComm["out_msg_size"], self.collectiveArgs.opTensor)
-
+            # record comm metrics
             self.collLat[collName].append(latency)
-
+            self.totalCommsLatency += latency
             curComm["seqnum"] = cnt
-            curComm["latency_us"] = latency
-            curComm["global_latency_us"] = global_latency
             curComm["quant_us"] = self.collectiveArgs.quant_time.getTimeUS()
             curComm["dequant_us"] = self.collectiveArgs.dequant_time.getTimeUS()
-            self.totalCommsLatency += latency
-            # Keep a copy of trace with performance (latency) and seqnum
-            self.traceWithPerf.append(curComm)
+            curComm["latency_us"] = latency
+            curComm["global_latency_us"] = global_latency
 
+            # record comm block metrics
             # categorized by the marker
             for curBlock in curBlocks:
                 # elem_size = self.collectiveArgs.ipTensor.element_size()
                 self.comms_blocks[curBlock].append(curComm)
+
+            # Keep a copy of trace with performance (latency) and seqnum
+            self.traceWithPerf.append(curComm)
 
             if self.backendFuncs.get_global_rank() == 0:
                 logger.info(
                     f"[{cnt} / {self.max_msg_cnt}] Replayed {collName} in block [{curBlockStack}]... {global_latency:.2f} us"
                 )
 
-        # make sure all ops are completed
+        # make sure all ops are completed, in the case of nonblocking, this will enqueue all remaining operations that did not have a wait op
         self.backendFuncs.sync_barrier(self.collectiveArgs)
+
+        # record how long it took for trace-replay to complete
+        endTime = time.monotonic_ns()
+        self.totalTraceLatency = (endTime-startTime) / 1e3 # make it us
+
+        # cleanup any memory left in use
         self.backendFuncs.clear_memory(self.collectiveArgs)
 
-    def runBench(self, comms_world_info, commsParams):
-        """Run the comms-replay benchmark:
+    def runBench(self, comms_world_info: comms_world_info_holder, commsParams: commsParamsHolderBase) -> None:
+        """
+        Run the comms-replay benchmark:
         1) Each rank reads its trace
         2) First pass of the trace to ensure the format is valid and get basic stats
         3) Execute communication replay [Skip if on dry-run mode]
         4) report stats and performance (if not dry-run)
+
+        Args:
+            comms_world_info: Holds information on the current environment.
+            commsParams: Holds comms params to pass into inner functions.
+        Returns:
+            None
         """
         logger.info(
             f"[Rank-{comms_world_info.global_rank}] reading trace from {self.trace_file}"
@@ -586,7 +752,7 @@ class commsTraceReplayBench(paramCommsBench):
 
         # rank 0 reports statistics
         if comms_world_info.global_rank == 0:
-            self.reportBenchTime(commsParams)
+            self.reportBenchTime()
             # writeCommDetails(self.comms_blocks, rank=comms_world_info.global_rank)
 
         if not self.is_dry_run:
@@ -599,7 +765,22 @@ class commsTraceReplayBench(paramCommsBench):
             self.backendFuncs.barrier(self.collectiveArgs)
             self.backendFuncs.complete_accel_ops(self.collectiveArgs)
 
-    def setBench(self, comms_world_info, commsParams):
+    def setBench(self, comms_world_info: comms_world_info_holder, commsParams: commsParamsHolderBase) -> None:
+        """
+        Initializes the replay backend.
+
+        Args:
+            comms_world_info: Holds current environment information.
+            commsParams: Holds comms params to pass into backend for initialization.
+        Returns:
+            None
+        """
+        # init process groups
+        for curComm in self.comms_trace[: self.max_msg_cnt]:
+            # record process group info
+            if curComm["comms"] == "init":
+                commsParams.groupRanks[curComm["pg_id"]] = curComm["global_ranks"]
+
         # init backend and corresponding function pointers
         if commsParams.nw_stack == "pytorch-dist":
             from pytorch_dist_backend import PyTorchDistBackend
@@ -632,7 +813,9 @@ class commsTraceReplayBench(paramCommsBench):
             self.backendFuncs
         )  # Getting ranks from backednFuncs object, since we cannot use MPI (e.g.: TPU) to launch all the processes
 
-        self.collectiveArgs.group = group
+        self.collectiveArgs.group = group # default group
+        self.collectiveArgs.groups = self.backendFuncs.get_groups()
+        self.collectiveArgs.num_pgs = self.backendFuncs.get_num_pgs()
         self.collectiveArgs.device = curDevice
         self.collectiveArgs.world_size = world_size
         self.collectiveArgs.global_rank = global_rank
@@ -641,7 +824,6 @@ class commsTraceReplayBench(paramCommsBench):
         self.collectiveArgs.srcOrDst = 0
         # FIXME: assuming it's always sum for reduce/allreduce operations
         self.collectiveArgs.op = self.backendFuncs.get_reduce_op("sum")
-        # FIXME: alwasy perfom blocking comms; may study non-blocking in the future
         self.collectiveArgs.asyncOp = not self.is_blocking
         self.collectiveArgs.ipTensor = None
         self.collectiveArgs.opTensor = None
@@ -653,7 +835,17 @@ class commsTraceReplayBench(paramCommsBench):
         else:
             self.allowList = [paramToCommName(op) for op in self.allowList.split(",")]
 
-    def initBench(self, comms_world_info, commsParams, args):
+
+    def initBench(self, commsParams: commsParamsHolderBase, args: argparse.Namespace) -> None:
+        """
+        Initializes replay parameters.
+
+        Args:
+            commsParams: Holds bitwidth information to initialize quantized communication context.
+            args: Namespace containing command line args that we will set our parameters with.
+        Returns:
+            None
+        """
         self.is_dry_run = args.dry_run
         self.shrink = args.auto_shrink
         self.max_msg_cnt = args.max_msg_cnt
@@ -662,6 +854,7 @@ class commsTraceReplayBench(paramCommsBench):
         self.allowList = args.allow_ops
         self.out_path = args.output_path
         self.colls_per_batch = args.colls_per_batch
+        self.use_timestamp = args.use_timestamp
 
         if commsParams.bitwidth < 32:
             comms_utils.initQuantCommCtx(self.collectiveArgs, commsParams)
@@ -678,8 +871,16 @@ class commsTraceReplayBench(paramCommsBench):
         if "://" in args.trace_path:
             self.use_remote_trace = True
 
-    def readTrace(self, remotePath):
-        """Read trace file from remote server or local disk"""
+    def readTrace(self, remotePath: str) -> None:
+        """
+        Read trace file from remote server or local disk. This will also convert/parse traces files if needed.
+        Supports conversions from KinetoTrace and PyTorch EG trace conversion is coming soon.
+
+        Args:
+            remotePath: Path to read from remotely if use_remote_trace is enabled.
+        Returns:
+            None
+        """
         if self.use_remote_trace:
             protocol = remotePath.split("://", 2)[
                 0
@@ -714,8 +915,13 @@ class commsTraceReplayBench(paramCommsBench):
             )
 
 
-def main():
-
+def main() -> None:
+    """
+    1) Read environment variables.
+    2) Parse commmand line arguments.
+    3) Read and analyze trace file.
+    4) Run replay.
+    """
     comms_env_params = comms_utils.read_comms_env_vars()
 
     traceBench = commsTraceReplayBench()
@@ -733,7 +939,7 @@ def main():
         args.master_ip, args.master_port, args.num_tpu_cores, comms_env_params
     )
     commsParams = comms_utils.commsParamsHolderBase(args)
-    traceBench.initBench(comms_world_info, commsParams, args)
+    traceBench.initBench(commsParams, args)
     traceBench.runBench(comms_world_info, commsParams)
 
 
