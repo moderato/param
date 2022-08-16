@@ -175,6 +175,16 @@ class Node:
                 return node
         return None
 
+    # Check if a tensor is used as an input by this node
+    def search_input_tensor(self, tensor) -> bool:
+        if tensor in self.inputs:
+            return True
+        for c in self.children:
+            use_this_tensor = c.search_input_tensor(tensor)
+            if use_this_tensor:
+                return True
+        return False
+
     def _get_parent_by_name(self, name) -> Node:
         if self.parent:
             if name in self.parent.name:
