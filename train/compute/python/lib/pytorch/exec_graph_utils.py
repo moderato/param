@@ -169,6 +169,8 @@ class Node:
         return None
 
     def get_child_by_name(self, names) -> Node:
+        if not isinstance(names, list):
+            names = [names]
         for name in names:
             node = self._get_child_by_name(name)
             if node is not None:
