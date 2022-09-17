@@ -349,12 +349,12 @@ class ExecutionGraph:
             # use json to serialize list of dict to string for set
             unique = {json.dumps(x, sort_keys=True) for x in attr["inputs"]}
             attr["inputs"] = list(map(json.loads, unique))
-            
+
         return ops
 
     def print_op_stats(self, detail: bool = False, clean: bool = False, json_format: bool = False):
         ops = self.get_unique_ops(detail, clean, json_format)
-        
+
         if json_format:
             print(json.dumps(ops, indent=2, sort_keys=True))
         else:
@@ -502,7 +502,7 @@ class ExecutionGraph:
         for node_id in t.sinks:
             sinks[node_id] = self.nodes[node_id].name
         print("    sinks:", sinks)
-        
+
     def remove_dataloader_ops(self):
         def check_parent(node):
             tmp = node
@@ -511,7 +511,7 @@ class ExecutionGraph:
                     return True
                 tmp = tmp.parent
             return False
-        
+
         if len(self.clean_nodes.keys()) == 0: # clean_nodes is empty
             for id, node in self.nodes.items():
                 if not check_parent(node): # if the op is not under dataloader
