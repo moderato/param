@@ -926,8 +926,8 @@ class commsCollBench(paramCommsBench):
         quantTimeTensorList,
         dequantTimeTensorList,
     ):
-        if commsParams.bench_params_file is None:
-            return
+        # if commsParams.bench_params_file is None:
+        #     return
         # convernt num_elements to # of elements per rank
         if commsParams.collective in (
             "all_to_all",
@@ -1467,7 +1467,7 @@ def main():
     )
 
     commsParams = comms_utils.commsParamsHolder(
-        args, comms_world_info, element_size, 
+        args, comms_world_info, element_size,
         collBenchObj.benchTime if args.bench_params_file is None else collBenchObj.benchTimeWithFile
     )
 
