@@ -16,7 +16,7 @@ import numpy as np
 
 # pytorch
 import torch
-from comms_utils import ensureTensorFlush, paramCommsBench
+from comms_utils import ensureTensorFlush, paramCommsBench, paramStreamGuard
 
 ### TODO: add these to class variables?
 supportedCollectives = [
@@ -25,8 +25,10 @@ supportedCollectives = [
     "all_to_all",
     "all_to_allv",
     "all_gather",
+    "all_gather_v",
     "broadcast",
     "reduce_scatter",
+    "reduce_scatter_v",
     "reduce_scatter_base",
     "all_gather_base",
     "incast",
@@ -54,6 +56,7 @@ class MultilineFormatter(argparse.ArgumentDefaultsHelpFormatter):
 class commsCollBench(paramCommsBench):
     def __init__(self):
         super().__init__(supportedNwstacks=["pytorch-dist", "pytorch-xla-tpu"])
+        self.tag = ""
 
     # def readCollArgs(self, parser):
     def readArgs(self, parser):
@@ -74,10 +77,18 @@ class commsCollBench(paramCommsBench):
             choices=["comms", "compute", "dlrm", "comms-compute"],
         )  # alternative is DLRM mode or comm-compute mode
         parser.add_argument(
-            "--b", type=str, default="8", help="minimum size, in bytes, to start with"
+            "--b",
+            "--begin-size",
+            type=str,
+            default="8",
+            help="minimum size, in bytes, to start with",
         )  # COMMS mode, begin the sweep at.
         parser.add_argument(
-            "--e", type=str, default="64", help="maximum size, in bytes, to end at"
+            "--e",
+            "--end-size",
+            type=str,
+            default="64",
+            help="maximum size, in bytes, to end at",
         )  # COMMS mode, end the sweep at.
         parser.add_argument(
             "--f", type=int, default=2, help="multiplication factor between sizes"
@@ -88,6 +99,35 @@ class commsCollBench(paramCommsBench):
             default=0,
             help="step bytes between sizes, 0 value disables step increment and uses multiplication factor instead",
         )  # COMMS mode, additive step bytes for sizes.
+        parser.add_argument(
+            "--i",
+            "--in-split",
+            type=lambda s: [int(item) for item in s.split(",") if item],
+            default=None,
+            help="comma-separated split of number of elements in input tensor",
+        )  # COMMS mode, input tensor split, by number of elements. Overrides --b and --e.
+        parser.add_argument(
+            "--o",
+            "--out-split",
+            type=lambda s: [int(item) for item in s.split(",") if item],
+            default=None,
+            help="comma-separated split of number of elements in output tensor",
+        )  # COMMS mode, output tensor split, by number of elements.
+        parser.add_argument(
+            "--ss",
+            "--sizes",
+            type=lambda s: [int(item) for item in s.split(",") if item],
+            default=None,
+            help="benchmark only specified sizes, comma-separated",
+        )  # COMMS mode, use specified sizes instead of increasing from small to large
+        parser.add_argument(
+            "--data-types",
+            "--data-type",
+            type=lambda s: [str(item) for item in s.split(",") if item],
+            default="float32",
+            help="comma-separated list of datatypes, supports "
+            + str(self.supportedDtype),
+        )  # The comma-separated list of data-types
         parser.add_argument(
             "--collective",
             "--collectives",
@@ -106,9 +146,17 @@ class commsCollBench(paramCommsBench):
         )  # Compute kernel: "gemm"
         parser.add_argument(
             "--num-compute",
+            "--num-compute-per-iteration",
             type=int,
             default=100,
-            help="one collective for every NUM_COMPUTE compute kernels",
+            help="number of compute kernels to execute for every iteration",
+        )  # Launch one coll for every n compute kernels
+        parser.add_argument(
+            "--num-coll",
+            "--num-coll-per-iteration",
+            type=int,
+            default=1,
+            help="number of collective operations to execute for every iteration",
         )  # Launch one coll for every n compute kernels
         # For GEMM
         parser.add_argument(
@@ -131,17 +179,31 @@ class commsCollBench(paramCommsBench):
             help="Embedding table hash size for Embedding table compute kernel",
         )  # Embedding table hash size
         parser.add_argument(
-            "--avg-len",
-            type=int,
-            default=28,
-            help="Average lookup operations per sample",
-        )  # Average #lookup per sample
-        parser.add_argument(
             "--batch-size",
             type=int,
             default=512,
             help="number of samples reading the table concurrently",
         )  # #Samples reading the table concurrently
+        parser.add_argument(
+            "--num-emb-tables-per-device",
+            "--ntables",
+            "--num-emb-tables",
+            type=int,
+            default=8,
+            help="Number of embedding tables (per device) for embedding table compute kernel",
+        )  # number of Embedding table
+        parser.add_argument(
+            "--num-emb-tables-batched",
+            type=int,
+            default=-1,
+            help="Number of embedding tables to batch together when doing embedding lookups and communication (-1 means to do no batching)",
+        )  # number of Embedding table batched
+        parser.add_argument(
+            "--bag-size",
+            type=int,
+            default=20,
+            help="bag size for Embedding table compute kernel",
+        )  # number of Embedding table
         parser.add_argument(
             "--root", type=int, default=0, help="root process for reduce benchmark"
         )  # root process for reduce and bcast (and gather, scatter, etc., if support in the future)
@@ -208,23 +270,112 @@ class commsCollBench(paramCommsBench):
             default=None,
             help="execute pytorch profiler at specified size",
         )  # execute pytorch profiler at specified size if applicable
+        parser.add_argument(
+            "--tag",
+            type=str,
+            default=None,
+            help="customized tag or keyword to be added into final output lines",
+        )  # execute pytorch profiler at specified size if applicable
 
         return parser.parse_known_args()
+
+    def _checkPt2Pt(self, args):
+        if args.pt2pt is None:
+            return args.collective
+        if args.pt2pt not in pt2ptPatterns:
+            logger.error(
+                f"Specified pt2pt pattern: {args.pt2pt} is not one of the supported pt2pt patterns: {str(pt2ptPatterns)}"
+            )
+            comms_utils.gracefulExit()
+        return "pt2pt"
+
+    def _check_for_in_out_split(self, args, element_size):
+        if args.i is None and args.o is None:
+            return args.b, args.e
+
+        if args.i is not None:
+            supported_split_coll = ["reduce_scatter_v", "all_to_allv"]
+            inout_len = sum(args.i)
+        else:
+            supported_split_coll = ["all_gather_v", "all_to_allv"]
+            inout_len = sum(args.o)
+
+        if not any(coll in args.collective.split(",") for coll in supported_split_coll):
+            logger.error(
+                "Collective does not support input-split argument (--i) or output-split argument (--o)"
+            )
+            comms_utils.gracefulExit()
+
+        logger.warning(
+            f"Overwriting begin-size (--b {args.b}) and end-size (--e {args.e}) to match requested input-split (--i) or output-split (--o)"
+        )
+
+        begin = inout_len * element_size
+        end = begin
+        return begin, end
+
+    def _check_device_type(self, args):
+        if args.device == "cpu" and args.backend == "nccl":
+            raise ValueError(f"NCCL is not supported for device type {args.device}")
+
+        # Overwrite user-input rocm device as we internally use cuda for both GPUs
+        if args.device == "rocm":
+            return "cuda"
+        return args.device
+
+    def _check_bitwidth(self, args):
+        if args.bitwidth >= 32:
+            return
+        if args.device != "cuda":
+            logger.error(
+                f"collective quantization may not be fully supported for {args.device}"
+            )
+        for coll in args.collective.split(","):
+            comms_utils.checkQuantArgs(
+                coll,
+                args.dtype,
+                args.b,
+                args.quant_a2a_embedding_dim,
+                args.z,
+            )
+
+    def syncCommBenchDataTypes(self, args):
+        args.data_types = list(set(args.data_types))
+        if args.data_types is None:
+            # If args --data-types is missing, replace it with value passed for --data-type arg.
+            if args.data_type is not None:
+                args.data_types = [args.data_type]
+
+            # If both --data-types and --data-type are not present, args.data_types is set to default value for dtype(ie; "float32")
+            else:
+                key = [
+                    key for key, value in self.dtypeMap.items() if value == self.dtype
+                ][0]
+                args.data_types = [key]
 
     def checkArgs(self, args):
         super().checkArgs(args)
 
-        if args.pt2pt is not None:
-            args.collective = "pt2pt"
-            if args.pt2pt not in pt2ptPatterns:
-                logger.error(
-                    f"Specified pt2pt pattern: {args.pt2pt} is not one of the supported pt2pt patterns: {str(pt2ptPatterns)}"
-                )
-                comms_utils.gracefulExit()
+        args.collective = self._checkPt2Pt(args)
 
         args.b = comms_utils.parsesize(args.b)
         args.e = comms_utils.parsesize(args.e)
+
+        if args.data_type not in self.supportedDtype:
+            logger.error(
+                f"Specified dtype: {args.data_type} is not one of the supported commstyle: {str(self.supportedDtype)}"
+            )
+            super().gracefulExit()
+        if args.data_type == "bfloat16" and args.backend == "gloo":
+            logger.error(
+                f"Specified dtype: {args.data_type} does not work with gloo backend"
+            )
+            super().gracefulExit()
+
         args.dtype = self.dtypeMap[args.data_type]
+        element_size = torch.ones([1], dtype=args.dtype).element_size()
+
+        args.b, args.e = self._check_for_in_out_split(args, element_size)
 
         if args.b < 1:
             logger.warning(
@@ -237,19 +388,13 @@ class commsCollBench(paramCommsBench):
                 f"the begin-size (--b {args.b}) is larger than the end-size (--e {args.e})"
             )
 
-        element_size = torch.ones([1], dtype=args.dtype).element_size()
         if args.sb % element_size != 0:
             logger.error("Step size bytes must be a multiple of element size")
             comms_utils.gracefulExit()
 
-        if args.device == "cpu" and args.backend == "nccl":
-            raise ValueError(f"NCCL is not supported for device type {args.device}")
+        args.device = self._check_device_type(args)
 
-        # Overwrite user-input rocm device as we internally use cuda for both GPUs
-        if args.device == "rocm":
-            args.device = "cuda"
-
-        reduce_ops = ["all_reduce", "reduce", "reduce_scatter"]
+        reduce_ops = ["all_reduce", "reduce", "reduce_scatter", "reduce_scatter_v"]
         if (
             args.c == 1
             and args.z == 0
@@ -261,22 +406,12 @@ class commsCollBench(paramCommsBench):
             args.c = 0
 
         # run a few sanity checks
-        if args.bitwidth < 32:
-            if args.device != "cuda":
-                logger.error(
-                    f"collective quantization may not be fully supported for {args.device}"
-                )
-            for coll in args.collective.split(","):
-                comms_utils.checkQuantArgs(
-                    coll,
-                    args.dtype,
-                    args.b,
-                    args.quant_a2a_embedding_dim,
-                    args.z,
-                )
+        self._check_bitwidth(args)
 
         if args.size_start_profiler:
             args.size_start_profiler = comms_utils.parsesize(args.size_start_profiler)
+
+        self.tag = f"-{args.tag}" if args.tag is not None else ""
 
     def runColl(self, comm_fn=None, compute_fn=None, comm_fn_pair=None, dcheck=False):
         self.backendFuncs.complete_accel_ops(self.collectiveArgs, initOp=True)
@@ -324,19 +459,24 @@ class commsCollBench(paramCommsBench):
                 self.backendFuncs.sync_barrier(self.collectiveArgs)
 
             start = time.monotonic()  # available only in py3
-            self.collectiveArgs.group = self.backendFuncs.get_next_group()
-            comm_fn(self.collectiveArgs)
-            # post another collecitve if on comms pair mode, otherwise it's noop
-            self.collectiveArgs.group = self.backendFuncs.get_next_group()
-            if enable_comms_pair:
+            for _ in range(self.collectiveArgs.numCollPerIter):
+                self.collectiveArgs.group = self.backendFuncs.get_next_group()
+                comm_fn(self.collectiveArgs)
+                # post another collecitve if on comms pair mode, otherwise it's noop
+                self.collectiveArgs.group = self.backendFuncs.get_next_group()
                 comm_fn_pair(self.collectiveArgs, pair=enable_comms_pair)
 
             if enable_compute:
-                for _ in range(self.collectiveArgs.numComputePerColl):
-                    # TODO: investigate the cache effect
-                    # Flush the cache
-                    # _ = torch.rand(6 * 1024 * 1024 // 4).float() * 2  # V100 6MB L2 cache
-                    compute_fn(self.collectiveArgs)
+                with paramStreamGuard(
+                    stream=self.collectiveArgs.compute_stream,
+                    curDevice=self.collectiveArgs.device,
+                    backendFuncs=self.backendFuncs,
+                ):
+                    for _ in range(self.collectiveArgs.numComputePerIter):
+                        # TODO: investigate the cache effect
+                        # Flush the cache
+                        # _ = torch.rand(6 * 1024 * 1024 // 4).float() * 2  # V100 6MB L2 cache
+                        compute_fn(self.collectiveArgs)
             if is_blocking:  # should be sychronous, wait for the collective
                 self.backendFuncs.complete_accel_ops(self.collectiveArgs)
             # Measuring time.
@@ -359,7 +499,9 @@ class commsCollBench(paramCommsBench):
         memSize = self.backendFuncs.get_mem_size(self.collectiveArgs)
 
         avgIterNS, algBW = comms_utils.getAlgBW(
-            elapsedTimeNS, memSize, self.collectiveArgs.numIters
+            elapsedTimeNS,
+            memSize,
+            self.collectiveArgs.numIters * self.collectiveArgs.numCollPerIter,
         )
         busBW = self.backendFuncs.getBusBW(
             self.collectiveArgs.collective,
@@ -373,7 +515,9 @@ class commsCollBench(paramCommsBench):
             memSize += memSize_pair
 
             _, algBW_pair = comms_utils.getAlgBW(
-                elapsedTimeNS, memSize_pair, self.collectiveArgs.numIters
+                elapsedTimeNS,
+                memSize_pair,
+                self.collectiveArgs.numIters * self.collectiveArgs.numCollPerIter,
             )
             algBW += algBW_pair
 
@@ -519,7 +663,9 @@ class commsCollBench(paramCommsBench):
             )  # keeping time in NS, helps in divising data by nanosecond
         uniLatencyNS = [lat / self.collectiveArgs.window for lat in uniLatencyNS]
         uniLatencyNS = np.mean(np.array(uniLatencyNS))
-        _, avgUniBW = comms_utils.getAlgBW(uniLatencyNS, memSize, 1)
+        _, avgUniBW = comms_utils.getAlgBW(
+            uniLatencyNS, memSize, self.collectiveArgs.numCollPerIter
+        )
         logger.debug("STATUS: end UniBW test.")
         return avgUniBW
 
@@ -565,7 +711,9 @@ class commsCollBench(paramCommsBench):
             )  # keeping time in NS, helps in divising data by nanosecond
         biLatencyNS = [lat / self.collectiveArgs.window for lat in biLatencyNS]
         biLatencyNS = np.mean(np.array(biLatencyNS))
-        _, avgBiBW = comms_utils.getAlgBW(biLatencyNS, 2 * memSize, 1)
+        _, avgBiBW = comms_utils.getAlgBW(
+            biLatencyNS, 2 * memSize, self.collectiveArgs.numCollPerIter
+        )
         logger.debug("STATUS: end UniBW test.")
         return avgBiBW
 
@@ -650,15 +798,22 @@ class commsCollBench(paramCommsBench):
         self.comm_size = world_size
         self.global_rank = global_rank
 
-        comms_utils.fixBeginSize(
-            commsParams, world_size
-        )  # Ensuring that all-reduce and all-to-all has atleast one member per rank.
-        allSizes = comms_utils.getSizes(
-            commsParams.beginSize,
-            commsParams.endSize,
-            commsParams.stepFactor,
-            commsParams.stepBytes,
-        )  # Given the begin-size, end-size, step-factor what are the message sizes to iterate on.
+        if commsParams.sizes is not None:
+            allSizes = commsParams.sizes
+            if global_rank == 0:
+                logger.info(
+                    f"Benchmarking with user-specified message sizes {allSizes}, --b and --e are ignored"
+                )
+        else:
+            comms_utils.fixBeginSize(
+                commsParams, world_size
+            )  # Ensuring that all-reduce and all-to-all has atleast one member per rank.
+            allSizes = comms_utils.getSizes(
+                commsParams.beginSize,
+                commsParams.endSize,
+                commsParams.stepFactor,
+                commsParams.stepBytes,
+            )  # Given the begin-size, end-size, step-factor what are the message sizes to iterate on.
 
         self.collectiveArgs.group = group
         self.collectiveArgs.groups = groups
@@ -680,6 +835,8 @@ class commsCollBench(paramCommsBench):
         self.collectiveArgs.pt2pt = commsParams.pt2pt
         self.collectiveArgs.window = commsParams.window
         self.collectiveArgs.asyncOp = False if commsParams.blockingFlag == 1 else True
+        self.collectiveArgs.numComputePerIter = commsParams.num_compute
+        self.collectiveArgs.numCollPerIter = commsParams.num_coll
 
         if commsParams.bitwidth < 32:
             comms_utils.initQuantCommCtx(self.collectiveArgs, commsParams)
@@ -688,6 +845,7 @@ class commsCollBench(paramCommsBench):
         if (
             commsParams.mode != "comms"
         ):  # Compute mode related initialization if not in comms-only mode
+            self.collectiveArgs.compute_stream = self.backendFuncs.get_new_stream()
             if commsParams.kernel == "gemm":
                 computeFunc = self.backendFuncs.gemm
 
@@ -705,36 +863,20 @@ class commsCollBench(paramCommsBench):
                 self.collectiveArgs.MMin1 = MMin1
                 self.collectiveArgs.MMin2 = MMin2
                 self.collectiveArgs.MMin3 = MMin3
-                self.collectiveArgs.numComputePerColl = commsParams.num_compute
+                if global_rank == 0:
+                    print(
+                        f"[Rank {global_rank:>3}] mode: {commsParams.mode}, num_coll: {commsParams.num_coll}, kernel: {commsParams.kernel}, num_compute {commsParams.num_compute}, mm_dim {mm_dim}"
+                    )
             elif commsParams.kernel == "emb_lookup":
+                comms_utils.init_emb_lookup(
+                    self.collectiveArgs, commsParams, self.backendFuncs
+                )
                 computeFunc = self.backendFuncs.emb_lookup
-
-                emb_dim = commsParams.emb_dim
-                num_embeddings = commsParams.num_embs
-                avg_length = commsParams.avg_len
-                batch_size = commsParams.batch_size
-                print(
-                    f"emb_dim {emb_dim} num_embs {num_embeddings} avg_len {avg_length} bs {batch_size}"
-                )
-                self.collectiveArgs.EmbWeights = self.backendFuncs.alloc_empty(
-                    [num_embeddings, emb_dim], torch.double, curDevice
-                )
-                self.collectiveArgs.TableOffsets = torch.LongTensor(
-                    [0, num_embeddings]
-                ).to(curDevice)
-                self.collectiveArgs.Indices = torch.LongTensor(
-                    np.random.randint(0, num_embeddings - 1, avg_length * batch_size)
-                ).to(curDevice)
-                lengths = np.ones((1, batch_size)) * avg_length
-                flat_lengths = lengths.flatten()
-                self.collectiveArgs.Offsets = torch.LongTensor(
-                    [0] + np.cumsum(flat_lengths).tolist()
-                ).to(curDevice)
-                self.collectiveArgs.LookupOut = self.backendFuncs.alloc_empty(
-                    [batch_size, emb_dim], torch.double, curDevice
-                )
-                self.collectiveArgs.AvgLengths = avg_length
-                self.collectiveArgs.numComputePerColl = commsParams.num_compute
+                if global_rank == 0:
+                    print(
+                        f"[Rank {global_rank:>3}] mode: {commsParams.mode}, num_coll: {commsParams.num_coll}, kernel: {commsParams.kernel}, num_compute {commsParams.num_compute}, "
+                        f"emb_dim {commsParams.emb_dim}, num_embs {commsParams.num_embs}, batch_size {commsParams.batch_size}"
+                    )
 
         self.backendFuncs.sync_barrier(self.collectiveArgs)
         if global_rank == 0:
@@ -804,7 +946,10 @@ class commsCollBench(paramCommsBench):
                 )
             )
         elif self.collectiveArgs.collective == "pt2pt":
-            fmt = "{:>15}{:>20}{:>10}{:>10}{:>25}{:>10}{:>10}{:>15}{:>15}{:>18}{:>18}" + tflops_fmt
+            fmt = (
+                "{:>40}{:>20}{:>10}{:>10}{:>25}{:>10}{:>10}{:>15}{:>15}{:>18}{:>18}"
+                + tflops_fmt
+            )
             header += fmt.format(
                 "size (B)",
                 "pingLatency(us):p50",
@@ -821,7 +966,7 @@ class commsCollBench(paramCommsBench):
             )
         else:
             if commsParams.bitwidth < 32:
-                fmt = "-QUANT\t{:>15}{:>18}{:>25}{:>15}{:>15}{:>15}" + tflops_fmt
+                fmt = "-QUANT\t{:>40}{:>18}{:>25}{:>15}{:>15}{:>15}" + tflops_fmt
                 header += fmt.format(
                     "size (B)",
                     "nElementsPerRank",
@@ -833,7 +978,7 @@ class commsCollBench(paramCommsBench):
                 )
             elif not self.collectiveArgs.pair:
                 fmt = (
-                    "{:>15}{:>18}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}"
+                    "{:>40}{:>18}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}"
                     + tflops_fmt
                 )
                 header += fmt.format(
@@ -850,7 +995,7 @@ class commsCollBench(paramCommsBench):
                 )
             else:
                 fmt = (
-                    "{:>15}{:>18}{:>22}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}"
+                    "{:>40}{:>18}{:>22}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}"
                     + tflops_fmt
                 )
                 header += fmt.format(
@@ -905,8 +1050,10 @@ class commsCollBench(paramCommsBench):
         dequant_p95 = np.percentile(dequantLatencyAcrossRanks, 95)
 
         print(
-            "\tCOMMS-RES-QUANT-{}\t{:>15}{:>18}{:>25}{:>15}{:>15}{:>15}".format(
+            "\tCOMMS-RES-QUANT-{}-{}{}\t{:>15}{:>18}{:>25}{:>15}{:>15}{:>15}".format(
                 self.collectiveArgs.collective,
+                self.collectiveArgs.data_type,
+                self.tag,
                 results["memSize"],
                 str("%d" % (results["numElements"])),
                 str("%.1f" % (quant_p95)),
@@ -933,8 +1080,10 @@ class commsCollBench(paramCommsBench):
             "all_to_all",
             "all_to_allv",
             "reduce_scatter",
+            "reduce_scatter_v",
             "reduce_scatter_base",
             "all_gather",
+            "all_gather_v",
             "all_gather_base",
         ):
             results["numElements"] = int(
@@ -980,7 +1129,7 @@ class commsCollBench(paramCommsBench):
         )
 
         m = commsParams.mm_dim
-        tflop = (2 * m * m * m) * self.collectiveArgs.numComputePerColl * 1e-12
+        tflop = (2 * m * m * m) * self.collectiveArgs.numComputePerIter * 1e-12
         secs = results["timeUS"] * 1e-6
         tflops = tflop / secs
         p50 = np.percentile(latencyAcrossCommRanks, 50)
@@ -998,12 +1147,14 @@ class commsCollBench(paramCommsBench):
 
         if not self.collectiveArgs.pair:
             fmt = (
-                "\tCOMMS-RES-{}{:>15}{:>18}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}"
+                "\tCOMMS-RES-{}-{}{}{:>18}{:>18}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}"
                 + tflops_fmt
             )
             print(
                 fmt.format(
                     self.collectiveArgs.collective,
+                    self.collectiveArgs.data_type,
+                    self.tag,
                     results["memSize"],
                     str("%d" % (results["numElements"])),
                     str("%.1f" % (p50)),
@@ -1024,12 +1175,14 @@ class commsCollBench(paramCommsBench):
                     // commsParams.comms_world_info.world_size
                 )
             fmt = (
-                "\tCOMMS-RES-{}{:>15}{:>18}{:>22}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}"
+                "\tCOMMS-RES-{}-{}{}{:>18}{:>18}{:>22}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}"
                 + tflops_fmt
             )
             print(
                 fmt.format(
                     self.collectiveArgs.collective,
+                    self.collectiveArgs.data_type,
+                    self.tag,
                     results["memSize"],
                     str("%d" % (results["numElements"])),
                     str("%d" % (results["numElements_pair"])),
@@ -1099,8 +1252,10 @@ class commsCollBench(paramCommsBench):
         ping_pong_p95 = np.percentile(pingPongLatencyAcrossCommRanks, 95)
 
         print(
-            "\tCOMMS-RES-{}{:>15}{:>20}{:>10}{:>10}{:>25}{:>10}{:>10}{:>15}{:>15}{:>18}{:>18}".format(
+            "\tCOMMS-RES-{}-{}{}{:>15}{:>20}{:>10}{:>10}{:>25}{:>10}{:>10}{:>15}{:>15}{:>18}{:>18}".format(
                 self.collectiveArgs.collective,
+                self.collectiveArgs.data_type,
+                self.tag,
                 results["memSize"],
                 str("%.1f" % (ping_p50)),
                 str("%.1f" % (ping_p75)),
@@ -1153,15 +1308,18 @@ class commsCollBench(paramCommsBench):
                 if commsParams.collective != "pt2pt":
                     collectiveFunc = backendFuncs.collectiveFunc[commsParams.collective]
 
+                commsArgs = comms_utils.commsArgs()
+                commsArgs.inMsgSize = numElements
+                commsArgs.outMsgSize = numElements
+                commsArgs.worldSize = world_size
+                commsArgs.inSplit = commsParams.inSplit
+                commsArgs.outSplit = commsParams.outSplit
+
                 (
                     self.collectiveArgs.ipTensor,
                     self.collectiveArgs.opTensor,
                 ) = self.prepComm(
-                    curComm={
-                        "in_msg_size": numElements,
-                        "out_msg_size": numElements,
-                        "world_size": world_size,
-                    },
+                    curComm=commsArgs,
                     commsParams=commsParams,
                 )
 
@@ -1185,18 +1343,19 @@ class commsCollBench(paramCommsBench):
                     self.collectiveArgs.dataSize_pair // commsParams.element_size
                 )
                 results["numElements_pair"] = self.collectiveArgs.numElements_pair
+                commsArgs = comms_utils.commsArgs()
+                commsArgs.inMsgSize = self.collectiveArgs.numElements_pair
+                commsArgs.outMsgSize = self.collectiveArgs.numElements_pair
+                commsArgs.worldSize = world_size
                 (
                     self.collectiveArgs.ipTensor_pair,
                     self.collectiveArgs.opTensor_pair,
                 ) = self.prepComm(
-                    curComm={
-                        "in_msg_size": self.collectiveArgs.numElements_pair,
-                        "out_msg_size": self.collectiveArgs.numElements_pair,
-                        "world_size": world_size,
-                    },
+                    curComm=commsArgs,
                     commsParams=commsParams,
                 )
 
+            self.collectiveArgs.data_type = commsParams.data_type
             if commsParams.size_start_profiler == curSize:
                 self.collectiveArgs.enable_profiler = comms_utils.startProfiler(
                     rank=self.backendFuncs.get_global_rank(),
@@ -1426,8 +1585,7 @@ class commsCollBench(paramCommsBench):
         try:
             backendObj.benchmark_comms()
         except ValueError as ve:
-            if commsParams.backend == "ucc":
-                logger.critical("PyTorch UCC not implemented? {}".format(repr(ve)))
+            logger.critical(repr(ve))
             raise
 
 
@@ -1441,18 +1599,16 @@ def main():
     )
     args, leftovers = collBenchObj.readArgs(parser)
 
-    collBenchObj.checkArgs(args)
-
     comms_env_params = comms_utils.read_comms_env_vars()
     if comms_env_params["global_rank"] == 0:
         print("\t MPI environment: %s " % (str(comms_env_params)))
         print(
-            "\t backend: %s nw-stack: %s mode: %s args.dtype: %s args.b: %d args.e: %d args.f: %d args.z: %s args.master_ip: %s "
+            "\t backend: %s nw-stack: %s mode: %s args.data_types: %s args.b: %s args.e: %s args.f: %s args.z: %s args.master_ip: %s "
             % (
                 args.backend,
                 args.nw_stack,
                 args.mode,
-                args.dtype,
+                args.data_types,
                 args.b,
                 args.e,
                 args.f,
@@ -1461,19 +1617,34 @@ def main():
             )
         )
 
-    element_size = torch.ones([1], dtype=args.dtype).element_size()
-    comms_world_info = comms_utils.comms_world_info_holder(
-        args.master_ip, args.master_port, args.num_tpu_cores, comms_env_params
-    )
+    # Dedupes and syncs value for args.data_types based on args.data_type/args.dtype if not passed in args.
+    collBenchObj.syncCommBenchDataTypes(args)
 
-    commsParams = comms_utils.commsParamsHolder(
-        args, comms_world_info, element_size,
-        collBenchObj.benchTime if args.bench_params_file is None else collBenchObj.benchTimeWithFile
-    )
+    for data_type in args.data_types:
+        args.data_type = data_type
 
-    if args.pair and args.overlap_pair_pgs:
-        commsParams.num_pgs = 2
-    collBenchObj.runBench(comms_world_info, commsParams)
+        collBenchObj.checkArgs(args)
+
+        element_size = torch.ones([1], dtype=args.dtype).element_size()
+        comms_world_info = comms_utils.comms_world_info_holder(
+            args.master_ip, args.master_port, args.num_tpu_cores, comms_env_params
+        )
+
+        if args.i is not None and (comms_world_info.world_size != len(args.i)):
+            logger.error("An input split must be provided for all participating ranks")
+            comms_utils.gracefulExit()
+
+        if args.o is not None and (comms_world_info.world_size != len(args.o)):
+            logger.error("An output split must be provided for all participating ranks")
+            comms_utils.gracefulExit()
+
+        commsParams = comms_utils.commsParamsHolder(
+            args, comms_world_info, element_size, collBenchObj.benchTime
+        )
+
+        if args.pair and args.overlap_pair_pgs:
+            commsParams.num_pgs = 2
+        collBenchObj.runBench(comms_world_info, commsParams)
 
 
 if __name__ == "__main__":

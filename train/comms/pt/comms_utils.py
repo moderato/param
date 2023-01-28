@@ -19,9 +19,10 @@ import time
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
 from collections import OrderedDict
+from contextlib import ContextDecorator
 from dataclasses import dataclass
 from io import StringIO
-from typing import Any, Callable, Dict, List, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 from torch._C._distributed_c10d import ProcessGroup
@@ -64,7 +65,14 @@ def parsesize(ipValue: str) -> int:
     size = 0.0
 
     value = ""
-    if ipValue.find("G") != -1:
+
+    # This function would be invoked in a loop - once for each data-type. For  first iteration, ipValue is of type string but after that,
+    # the type of ipValue equals the returntype of prior iteration ie; int. Hence, type check is moved up as first condition.
+    if isinstance(ipValue, int) or ipValue.isnumeric():
+        units = 1
+        value = ipValue
+
+    elif ipValue.find("G") != -1:
         units = 1024 * 1024 * 1024
         unitIdx = ipValue.find("G")
         value = ipValue[0:unitIdx]
@@ -78,9 +86,7 @@ def parsesize(ipValue: str) -> int:
         units = 1024
         unitIdx = ipValue.find("K")
         value = ipValue[0:unitIdx]
-    elif ipValue.isnumeric():
-        units = 1
-        value = ipValue
+
     else:
         logger.error(f"Could not parse input size {ipValue}")
         gracefulExit()
@@ -140,7 +146,7 @@ def getAlgBW(elapsedTimeNS: float, dataSize: int, numIters: int) -> (float, floa
     """
     avgIterNS = 0.0
     if numIters != 0:
-        avgIterNS = elapsedTimeNS / (numIters)
+        avgIterNS = elapsedTimeNS / numIters
 
     algBW = 0.0
     if avgIterNS != 0:
@@ -194,6 +200,7 @@ def fixBeginSize(commsParams: commsParamsHolder, world_size: int) -> None:
         "all_gather",
         "all_gather_base",
         "gather",
+        "reduce_scatter_base",
     ):
         if (commsParams.beginSize / commsParams.element_size) < world_size:
             commsParams.beginSize = world_size * commsParams.element_size
@@ -522,6 +529,100 @@ class paramTimer:
         return self.elapsedTimeNS
 
 
+class commsArgs:
+    """
+    This class contains all of the args that we can use to perform a single collective.
+
+    Public Attributes:
+        comms: Name of collective.
+        seqnum: Current number of collectives.
+        req: Request ID of collective to map to wait operation.
+        inMsgSize: Size of input tensor.
+        outMsgSize: Size of output tensor.
+        dtype: Data type of tensor values.
+        inSplit: List of input split sizes for rank across current process group.
+        outSplit: List of output split sizes for ranks across current process group.
+        startTimeNs: Start time of current collective.
+        pgId: Unique indentifier for the process group this collective will use.
+        groupRanks: Global ranks of the process group, this is used with PG init.
+        worldSize: World size of current process group.
+        markerStack: Current markers that this collective is a part of.
+        root: Used to determine if collective is src or dst.
+        eg_id: Node id in captured execution graph.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        """
+        Initialize arguments used for comm replay.
+        """
+        self.comms = kwargs["comms"] if "comms" in kwargs else None
+        self.seqnum = kwargs["seqnum"] if "seqnum" in kwargs else None
+        self.req = kwargs["req"] if "req" in kwargs else None
+        self.inMsgSize = kwargs["inMsgSize"] if "inMsgSize" in kwargs else None
+        self.outMsgSize = kwargs["outMsgSize"] if "outMsgSize" in kwargs else None
+        self.dtype = kwargs["dtype"] if "dtype" in kwargs else None
+        self.inSplit = kwargs["inSplit"] if "inSplit" in kwargs else None
+        self.outSplit = kwargs["outSplit"] if "outSplit" in kwargs else None
+        self.startTimeNs = kwargs["startTimeNs"] if "startTimeNs" in kwargs else None
+        self.pgId = kwargs["pgId"] if "pgId" in kwargs else None
+        self.groupRanks = kwargs["groupRanks"] if "groupRanks" in kwargs else None
+        self.worldSize = kwargs["worldSize"] if "worldSize" in kwargs else None
+        self.markerStack = kwargs["markerStack"] if "markerStack" in kwargs else None
+        self.root = kwargs["root"] if "root" in kwargs else None
+        self.eg_id = kwargs["eg_id"] if "eg_id" in kwargs else None
+
+    def toDict(self) -> Dict:
+        """
+        Convert commsArgs to dictionary for storing in json.
+
+        Args:
+            None
+        Returns:
+            commData: Dictionary containing the comms metadata.
+        """
+        commData = {}
+        commData["comms"] = self.comms
+        commData["seqnum"] = self.seqnum
+        if self.req is not None:
+            commData["req"] = self.req
+        if self.inMsgSize is not None:
+            commData["in_msg_size"] = self.inMsgSize
+            commData["out_msg_size"] = self.outMsgSize
+            commData["dtype"] = self.dtype
+        if self.inSplit is not None:
+            commData["in_split"] = self.inSplit
+        if self.outSplit is not None:
+            commData["out_split"] = self.outSplit
+        if self.startTimeNs is not None:
+            commData["startTime_ns"] = self.startTimeNs
+        if self.pgId is not None:
+            commData["pg_id"] = self.pgId
+        if self.worldSize is not None:
+            commData["world_size"] = self.worldSize
+        if self.root is not None:
+            commData["root"] = self.root
+
+        return commData
+
+    def __eq__(self, other: commsArgs) -> bool:
+        """
+        Used for testing. Check if two comms are equal.
+        """
+        return self.__dict__ == other.__dict__
+
+    def __repr__(self):
+        """
+        Print repr of commsArgs in human readable format.
+        """
+        return self.__dict__.__str__()
+
+    def __str__(self) -> str:
+        """
+        Print out the commsArgs in human readable format.
+        """
+        return self.__dict__.__str__()
+
+
 class paramProfile(record_function):
     """Inherit from PyTorch profiler to enable autoguard profiling while measuring the time interval in PARAM"""
 
@@ -543,6 +644,28 @@ class paramProfile(record_function):
             self.timer.incrTimeNS(self.intervalNS)
         logger.debug(f"{self.description} took {self.intervalNS} ns")
         super().__exit__(exc_type, exc_value, traceback)
+
+
+class paramStreamGuard(ContextDecorator):
+    """guard execution on a stream"""
+
+    def __init__(
+        self,
+        stream: Optional[torch.cuda.Stream],
+        curDevice: torch.device,
+        backendFuncs: backendFunctions,
+    ) -> None:
+        self.cur_stream = None
+        self.stream = stream
+        self.curDevice = curDevice
+        self.backendFuncs = backendFuncs
+
+    def __enter__(self) -> paramStreamGuard:
+        self.cur_stream = self.backendFuncs.switch_stream(self.stream, self.curDevice)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.backendFuncs.switch_stream(self.cur_stream, self.curDevice)
 
 
 class backendFunctions(ABC):
@@ -806,6 +929,38 @@ class commsParamsHolderBase:
         self.groupRanks = (
             {}
         )  # record what ranks each process group will work on {pg_id, ranks}
+        self.use_ext_dist = args.use_ext_dist
+
+
+class commsDlrmParamsHolder(commsParamsHolderBase):
+    """Class holding object for the input parameters of DLRM benchmark."""
+
+    def __init__(
+        self,
+        args,
+        mpi_env_params: Dict[str:int],
+    ) -> None:
+        super().__init__(args)
+
+        # extra DLRM parameters
+        self.numDevices = mpi_env_params["world_size"]
+        self.numBatches = args.num_batches + args.warmup_batches
+        # NOTE: Should ensure that dataSize = int(N) * numDevices * batchSize
+        self.numBatchesPerEpoch = args.mini_batch_size
+        self.dataSize = (
+            mpi_env_params["world_size"] * self.numBatches * self.numBatchesPerEpoch
+        )
+        self.embedLayers = []  # scaledEmbedLayers
+        self.mini_batch_size = args.mini_batch_size
+        self.arch_sparse_feature_size = args.arch_sparse_feature_size
+        self.nw_stack = args.nw_stack
+        self.warmup_batches = args.warmup_batches
+        self.device = args.device
+        self.backend = args.backend
+
+        # additional parameters used in runBench()
+        self.perf_debug = args.perf_debug
+        self.print_comms = args.print_comms
 
 class dlrmParamsHolder(commsParamsHolderBase):
     def __init__(self, args, mpi_env_params, benchTime):
@@ -843,9 +998,13 @@ class commsParamsHolder(commsParamsHolderBase):
         super().__init__(args)
 
         self.element_size = element_size
+        self.sizes = args.ss
         self.beginSize = args.b
         self.endSize = args.e
         self.maxSize = int(args.e // self.element_size)
+        self.inSplit = args.i
+        self.outSplit = args.o
+        self.data_type = args.data_type
         self.stepFactor = args.f
         self.stepBytes = args.sb
         self.srcOrDst = args.root
@@ -861,11 +1020,14 @@ class commsParamsHolder(commsParamsHolderBase):
 
         self.kernel = args.kernel
         self.num_compute = args.num_compute
+        self.num_coll = args.num_coll
         self.mm_dim = args.mm_dim
         self.emb_dim = args.emb_dim
-        self.avg_len = args.avg_len
-        self.num_embs = args.num_embs
         self.batch_size = args.batch_size
+        self.num_embs = args.num_embs
+        self.num_emb_tables_per_device = args.num_emb_tables_per_device
+        self.num_emb_tables_batched = args.num_emb_tables_batched
+        self.bag_size = args.bag_size
         self.benchTime = benchTime
 
         self.pair = args.pair
@@ -891,6 +1053,7 @@ class collectiveArgsHolder:
         self.num_pgs = 0
         self.device = {}
         self.world_size = 0
+        self.data_type = ""
 
         self.numIters = 0
         self.numWarmupIters = 0
@@ -906,15 +1069,17 @@ class collectiveArgsHolder:
         self.MMin1 = {}
         self.MMin2 = {}
         self.MMin3 = {}
-        self.numComputePerColl = 0
+        self.numComputePerIter = 0
+        self.numCollPerIter = 0
+        self.batch_size = 0
 
-        self.EmbWeights = {}
-        self.TableOffsets = {}
-        self.Indices = {}
-        self.Offsets = {}
+        self.emb = None
+        self.embRequests = None
+        self.emb_dim = 0
+        self.num_emb_tables_batched = 0
+        self.num_emb_ops = 0
         self.BTBlockSize = {}
         self.LookupOut = {}
-        self.AvgLengths = {}
 
         self.ipTensor_split = []
         self.opTensor_split = []
@@ -945,6 +1110,9 @@ class collectiveArgsHolder:
         self.dequant_time = paramTimer()
         self.enable_profiler = False
 
+        self.compute_stream = None
+        self.use_ext_dist = False
+
 
 class paramCommsBench(ABC):
     """Abstract class for any param comms benchmark."""
@@ -957,6 +1125,7 @@ class paramCommsBench(ABC):
             "int32": torch.int32,
             "long": torch.long,
             "float16": torch.half,
+            "bfloat16": torch.bfloat16,
             "float64": torch.double,
             "bool": torch.bool,
             "Float": torch.float32,
@@ -994,7 +1163,11 @@ class paramCommsBench(ABC):
         expRes = self.initVal
         if (
             commsParams.collective
-            in ("all_reduce", "reduce_scatter", "reduce_scatter_base")
+            in (
+                "all_reduce",
+                "reduce_scatter",
+                "reduce_scatter_base",
+            )
         ) or (
             self.backendFuncs.get_global_rank() == commsParams.srcOrDst
             and commsParams.collective == "reduce"
@@ -1071,7 +1244,7 @@ class paramCommsBench(ABC):
     def _prep_all_to_allv(
         self,
         ipTensor: torch.tensor,
-        curComm: Dict[str, Any],
+        curComm: commsArgs,
         commsParams: commsParamsHolderBase,
         numElementsIn: int,
         numElementsOut: int,
@@ -1079,22 +1252,25 @@ class paramCommsBench(ABC):
         curDevice: str,
         dtype: torch.dtype,
         scaleFactor: float,
+        allocate: bool = True,
     ) -> (torch.Tensor, torch.Tensor):
         """Prepare the all_to_allv mode"""
 
-        # all_to_allv requires two tensors
-        opTensor = self.backendFuncs.alloc_random(
-            [numElementsOut], curDevice, dtype, scaleFactor
-        )
+        opTensor = []
+        if allocate:
+            # all_to_allv requires two tensors
+            opTensor = self.backendFuncs.alloc_random(
+                [numElementsOut], curDevice, dtype, scaleFactor
+            )
         # all_to_allv requires tensors to specify split
         self.collectiveArgs.opTensor_split = (
-            curComm["out_split"]
-            if ("out_split" in curComm.keys())
+            curComm.outSplit
+            if (curComm.outSplit is not None)
             else [(numElementsOut // world_size) for _ in range(world_size)]
         )
         self.collectiveArgs.ipTensor_split = (
-            curComm["in_split"]
-            if ("in_split" in curComm.keys())
+            curComm.inSplit
+            if (curComm.inSplit is not None)
             else [(numElementsIn // world_size) for _ in range(world_size)]
         )
         return (ipTensor, opTensor)
@@ -1102,7 +1278,7 @@ class paramCommsBench(ABC):
     def _prep_all_to_all(
         self,
         ipTensor: torch.tensor,
-        curComm: Dict[str, Any],
+        curComm: commsArgs,
         commsParams: commsParamsHolderBase,
         numElementsIn: int,
         numElementsOut: int,
@@ -1110,43 +1286,45 @@ class paramCommsBench(ABC):
         curDevice: str,
         dtype: torch.dtype,
         scaleFactor: float,
+        allocate: bool = True,
     ) -> (torch.Tensor, torch.Tensor):
         # all_to_all requires two tensor lists, e.g., List[torch.Tensor]
 
         ipTensor = []
         opTensor = []
-        if commsParams.dcheck == 1:
-            for _ in range(world_size):
-                ipTensor.append(
-                    self.backendFuncs.alloc_ones(
-                        [(numElementsIn // world_size)],
-                        curDevice,
-                        commsParams.dtype,
-                        self.initVal,
+        if allocate:
+            if commsParams.dcheck == 1:
+                for _ in range(world_size):
+                    ipTensor.append(
+                        self.backendFuncs.alloc_ones(
+                            [(numElementsIn // world_size)],
+                            curDevice,
+                            commsParams.dtype,
+                            self.initVal,
+                        )
                     )
-                )
-        else:
+            else:
+                for _ in range(world_size):
+                    ipTensor.append(
+                        self.backendFuncs.alloc_random(
+                            [(numElementsIn // world_size)],
+                            curDevice,
+                            commsParams.dtype,
+                            scaleFactor,
+                        )
+                    )
             for _ in range(world_size):
-                ipTensor.append(
+                opTensor.append(
                     self.backendFuncs.alloc_random(
-                        [(numElementsIn // world_size)],
-                        curDevice,
-                        commsParams.dtype,
-                        scaleFactor,
+                        [(numElementsOut // world_size)], curDevice, dtype, scaleFactor
                     )
                 )
-        for _ in range(world_size):
-            opTensor.append(
-                self.backendFuncs.alloc_random(
-                    [(numElementsOut // world_size)], curDevice, dtype, scaleFactor
-                )
-            )
         return (ipTensor, opTensor)
 
     def _prep_all_gather(
         self,
         ipTensor: torch.tensor,
-        curComm: Dict[str, Any],
+        curComm: commsArgs,
         commsParams: commsParamsHolderBase,
         numElementsIn: int,
         numElementsOut: int,
@@ -1154,33 +1332,35 @@ class paramCommsBench(ABC):
         curDevice: str,
         dtype: torch.dtype,
         scaleFactor: float,
+        allocate: bool = True,
     ) -> (torch.Tensor, torch.Tensor):
         opTensor = []
 
-        if commsParams.dcheck == 1:
-            ipTensor = self.backendFuncs.alloc_ones(
-                [numElementsIn // world_size],
-                curDevice,
-                dtype,
-                scaleFactor=self.initVal,
-            )
-        else:
-            ipTensor = self.backendFuncs.alloc_random(
-                [numElementsIn // world_size], curDevice, dtype, scaleFactor
-            )
-        # allgather requires a tensor list, e.g., List[torch.Tensor]
-        for _ in range(world_size):
-            opTensor.append(
-                self.backendFuncs.alloc_random(
+        if allocate:
+            if commsParams.dcheck == 1:
+                ipTensor = self.backendFuncs.alloc_ones(
+                    [numElementsIn // world_size],
+                    curDevice,
+                    dtype,
+                    scaleFactor=self.initVal,
+                )
+            else:
+                ipTensor = self.backendFuncs.alloc_random(
                     [numElementsIn // world_size], curDevice, dtype, scaleFactor
                 )
-            )
+            # allgather requires a tensor list, e.g., List[torch.Tensor]
+            for _ in range(world_size):
+                opTensor.append(
+                    self.backendFuncs.alloc_random(
+                        [numElementsIn // world_size], curDevice, dtype, scaleFactor
+                    )
+                )
         return (ipTensor, opTensor)
 
     def _prep_all_gather_base(
         self,
         ipTensor: torch.tensor,
-        curComm: Dict[str, Any],
+        curComm: commsArgs,
         commsParams: commsParamsHolderBase,
         numElementsIn: int,
         numElementsOut: int,
@@ -1188,32 +1368,35 @@ class paramCommsBench(ABC):
         curDevice: str,
         dtype: torch.dtype,
         scaleFactor: float,
+        allocate: bool = True,
     ) -> (torch.Tensor, torch.Tensor):
 
-        if commsParams.dcheck == 1:
-            ipTensor = self.backendFuncs.alloc_ones(
-                [numElementsIn // world_size],
+        opTensor = []
+        if allocate:
+            if commsParams.dcheck == 1:
+                ipTensor = self.backendFuncs.alloc_ones(
+                    [numElementsIn // world_size],
+                    curDevice,
+                    dtype,
+                    scaleFactor=self.initVal,
+                )
+            else:
+                ipTensor = self.backendFuncs.alloc_random(
+                    [numElementsIn // world_size], curDevice, dtype, scaleFactor
+                )
+            # this is a single all gather with flat output tensor
+            opTensor = self.backendFuncs.alloc_random(
+                numElementsIn,
                 curDevice,
                 dtype,
-                scaleFactor=self.initVal,
+                scaleFactor,
             )
-        else:
-            ipTensor = self.backendFuncs.alloc_random(
-                [numElementsIn // world_size], curDevice, dtype, scaleFactor
-            )
-        # this is a single all gather with flat output tensor
-        opTensor = self.backendFuncs.alloc_random(
-            numElementsIn,
-            curDevice,
-            dtype,
-            scaleFactor,
-        )
         return (ipTensor, opTensor)
 
     def _prep_incast(
         self,
         ipTensor: torch.tensor,
-        curComm: Dict[str, Any],
+        curComm: commsArgs,
         commsParams: commsParamsHolderBase,
         numElementsIn: int,
         numElementsOut: int,
@@ -1221,22 +1404,24 @@ class paramCommsBench(ABC):
         curDevice: str,
         dtype: torch.dtype,
         scaleFactor: float,
+        allocate: bool = True,
     ) -> (torch.Tensor, torch.Tensor):
         # incast requires a tensor list with length of src_ranks, e.g., List[torch.Tensor]
         opTensor = []
 
-        for _ in self.collectiveArgs.src_ranks:
-            opTensor.append(
-                self.backendFuncs.alloc_random(
-                    [numElementsOut], curDevice, dtype, scaleFactor
+        if allocate:
+            for _ in self.collectiveArgs.src_ranks:
+                opTensor.append(
+                    self.backendFuncs.alloc_random(
+                        [numElementsOut], curDevice, dtype, scaleFactor
+                    )
                 )
-            )
         return (ipTensor, opTensor)
 
     def _prep_reduce_scatter(
         self,
         ipTensor: torch.tensor,
-        curComm: Dict[str, Any],
+        curComm: commsArgs,
         commsParams: commsParamsHolderBase,
         numElementsIn: int,
         numElementsOut: int,
@@ -1244,38 +1429,41 @@ class paramCommsBench(ABC):
         curDevice: str,
         dtype: torch.dtype,
         scaleFactor: float,
+        allocate: bool = True,
     ) -> (torch.Tensor, torch.Tensor):
 
         ipTensor = []
-        if commsParams.dcheck == 1:
-            for _ in range(world_size):
-                ipTensor.append(
-                    self.backendFuncs.alloc_ones(
-                        [numElementsOut // world_size],
-                        curDevice,
-                        commsParams.dtype,
-                        self.initVal,
+        opTensor = []
+        if allocate:
+            if commsParams.dcheck == 1:
+                for _ in range(world_size):
+                    ipTensor.append(
+                        self.backendFuncs.alloc_ones(
+                            [numElementsOut // world_size],
+                            curDevice,
+                            commsParams.dtype,
+                            self.initVal,
+                        )
                     )
-                )
-        else:
-            for _ in range(world_size):
-                ipTensor.append(
-                    self.backendFuncs.alloc_random(
-                        [numElementsOut // world_size],
-                        curDevice,
-                        commsParams.dtype,
-                        scaleFactor,
+            else:
+                for _ in range(world_size):
+                    ipTensor.append(
+                        self.backendFuncs.alloc_random(
+                            [numElementsOut // world_size],
+                            curDevice,
+                            commsParams.dtype,
+                            scaleFactor,
+                        )
                     )
-                )
-        opTensor = self.backendFuncs.alloc_random(
-            [numElementsOut // world_size], curDevice, dtype, scaleFactor
-        )
+            opTensor = self.backendFuncs.alloc_random(
+                [numElementsOut // world_size], curDevice, dtype, scaleFactor
+            )
         return (ipTensor, opTensor)
 
     def _prep_reduce_scatter_base(
         self,
         ipTensor: torch.tensor,
-        curComm: Dict[str, Any],
+        curComm: commsArgs,
         commsParams: commsParamsHolderBase,
         numElementsIn: int,
         numElementsOut: int,
@@ -1283,32 +1471,35 @@ class paramCommsBench(ABC):
         curDevice: str,
         dtype: torch.dtype,
         scaleFactor: float,
+        allocate: bool = True,
     ) -> (torch.Tensor, torch.Tensor):
 
         ipTensor = []
-        if commsParams.dcheck == 1:
-            ipTensor = self.backendFuncs.alloc_ones(
-                numElementsOut,
-                curDevice,
-                commsParams.dtype,
-                self.initVal,
+        opTensor = []
+        if allocate:
+            if commsParams.dcheck == 1:
+                ipTensor = self.backendFuncs.alloc_ones(
+                    numElementsOut,
+                    curDevice,
+                    commsParams.dtype,
+                    self.initVal,
+                )
+            else:
+                ipTensor = self.backendFuncs.alloc_random(
+                    numElementsOut,
+                    curDevice,
+                    commsParams.dtype,
+                    scaleFactor,
+                )
+            opTensor = self.backendFuncs.alloc_random(
+                [numElementsOut // world_size], curDevice, dtype, scaleFactor
             )
-        else:
-            ipTensor = self.backendFuncs.alloc_random(
-                numElementsOut,
-                curDevice,
-                commsParams.dtype,
-                scaleFactor,
-            )
-        opTensor = self.backendFuncs.alloc_random(
-            [numElementsOut // world_size], curDevice, dtype, scaleFactor
-        )
         return (ipTensor, opTensor)
 
     def _prep_pt2pt(
         self,
         ipTensor: torch.tensor,
-        curComm: Dict[str, Any],
+        curComm: commsArgs,
         commsParams: commsParamsHolderBase,
         numElementsIn: int,
         numElementsOut: int,
@@ -1316,18 +1507,24 @@ class paramCommsBench(ABC):
         curDevice: str,
         dtype: torch.dtype,
         scaleFactor: float,
+        allocate: bool = True,
     ) -> (torch.Tensor, torch.Tensor):
         # pt2pt or out-of-place collectives
-        opTensor = self.backendFuncs.alloc_random(
-            [numElementsOut],
-            curDevice,
-            dtype,
-            scaleFactor,
-        )
+        opTensor = []
+        if allocate:
+            opTensor = self.backendFuncs.alloc_random(
+                [numElementsOut],
+                curDevice,
+                dtype,
+                scaleFactor,
+            )
         return (ipTensor, opTensor)
 
     def prepComm(
-        self, curComm: Dict[str, Any], commsParams: commsParamsHolderBase
+        self,
+        curComm: commsArgs,
+        commsParams: commsParamsHolderBase,
+        allocate: bool = True,
     ) -> (torch.Tensor, torch.Tensor):
         """
         Allocate the tensors for collective.
@@ -1339,16 +1536,16 @@ class paramCommsBench(ABC):
             (iptensor, optensor): Appropriate input and output tensors for collective.
         """
         commOp = paramToCommName(
-            curComm["comms"] if ("comms" in curComm.keys()) else commsParams.collective,
+            curComm.comms if (curComm.comms is not None) else commsParams.collective,
             supported_comms=self.backendFuncs.collectiveFunc.keys(),
         )
 
         if commOp in ("wait", "barrier"):
             return ([], [])
 
-        numElementsIn = curComm["in_msg_size"]
+        numElementsIn = curComm.inMsgSize
         # numElementsOut is only meaningful for out-of-place collectives and pt2pt
-        numElementsOut = curComm["out_msg_size"]
+        numElementsOut = curComm.outMsgSize
         world_size = self.collectiveArgs.world_size
         dtype = commsParams.dtype
         curDevice = commsParams.device
@@ -1356,16 +1553,18 @@ class paramCommsBench(ABC):
         scaleFactor = numElementsOut * numElementsOut
         opTensor = []
 
-        if commsParams.dcheck == 1:
-            # use predictable values for data validation check
-            ipTensor = self.backendFuncs.alloc_ones(
-                [numElementsIn], curDevice, dtype, scaleFactor=self.initVal
-            )
+        if allocate:
+            if commsParams.dcheck == 1:
+                # use predictable values for data validation check
+                ipTensor = self.backendFuncs.alloc_ones(
+                    [numElementsIn], curDevice, dtype, scaleFactor=self.initVal
+                )
+            else:
+                ipTensor = self.backendFuncs.alloc_random(
+                    [numElementsIn], curDevice, dtype, scaleFactor
+                )
         else:
-            ipTensor = self.backendFuncs.alloc_random(
-                [numElementsIn], curDevice, dtype, scaleFactor
-            )
-
+            ipTensor = []
         # TODO: consider using this dictionary to check valid keywords rather than silently defaulting
 
         dispatchDict = {
@@ -1393,6 +1592,7 @@ class paramCommsBench(ABC):
                 curDevice,
                 dtype,
                 scaleFactor,
+                allocate,
             )
         else:
             # in-place case for other collectives such as allreduce, reduce, broadcast
@@ -1442,13 +1642,7 @@ class paramCommsBench(ABC):
         )  # The network stack to profile.
         parser.add_argument(
             "--dtype", type=torch.dtype, default=torch.float32
-        )  # will be overwritten based on args.data_type and dtypeMap.
-        parser.add_argument(
-            "--data-type",
-            type=str,
-            default="float32",
-            help="the base data type, supports " + str(self.supportedDtype),
-        )  # The data type
+        )  # will be overwritten based on args.data_types and dtypeMap.
         parser.add_argument(
             "--num-tpu-cores",
             type=int,
@@ -1479,7 +1673,7 @@ class paramCommsBench(ABC):
         parser.add_argument(
             "--z",
             type=int,
-            default=1,
+            default=0,
             help="use blocking mode for collectives",
             choices=[0, 1],
         )  # 'sync/blocking' : 1 , 'async/non-blocking' : 0
@@ -1510,6 +1704,13 @@ class paramCommsBench(ABC):
             help="enable data validation check",
             choices=[0, 1],
         )  # validation check
+        parser.add_argument(
+            "--use-ext-dist",
+            "--use-ext-pg",
+            action="store_true",
+            default=False,
+            help="use extend_distributed wrapper",
+        )  # use extend_distributed wrapper to init and create PGs
         pass
 
     @abstractmethod
@@ -1518,11 +1719,6 @@ class paramCommsBench(ABC):
         if args.nw_stack not in self.supportedNwstacks:
             logger.error(
                 f"Specified backend: {args.nw_stack} is not one of the supported backends: {str(self.supportedNwstacks)}. Make sure the input is using the correct case."
-            )
-            gracefulExit()
-        if args.data_type not in self.supportedDtype:
-            logger.error(
-                f"Specified dtype: {args.data_type} is not one of the supported commstyle: {str(self.supportedDtype)}"
             )
             gracefulExit()
         if args.num_tpu_cores not in self.supported_tpu_core_valuses:
@@ -1574,3 +1770,71 @@ class paramCommsBench(ABC):
                 )
         else:
             os.environ["MASTER_PORT"] = args.master_port
+
+
+def init_emb_lookup(collectiveArgs, commsParams, backendFuncs):
+    """
+    Initialize embedding table op
+
+    Args:
+        collectiveArgs: collective arguments.
+        commsParams: Holds parameters that affect tensor allocation.
+        backendFuncs: backend function
+    Returns:
+        None
+    """
+    try:
+        # fbgemm_gpu can be downloaded from https://github.com/pytorch/FBGEMM/tree/main/fbgemm_gpu
+        from fbgemm_gpu.split_embedding_utils import generate_requests
+
+        from fbgemm_gpu.split_table_batched_embeddings_ops import (
+            ComputeDevice,
+            EmbeddingLocation,
+            OptimType,
+            SplitTableBatchedEmbeddingBagsCodegen,
+        )
+    except ImportError:
+        logger.error("benchmarking with emb_lookup kernels requires fbgemm_gpu library")
+        return
+    collectiveArgs.emb_dim = commsParams.emb_dim
+    num_embeddings = commsParams.num_embs
+    collectiveArgs.batch_size = commsParams.batch_size
+    num_tables_per_device = commsParams.num_emb_tables_per_device
+    collectiveArgs.num_emb_tables_batched = commsParams.num_emb_tables_batched
+    bag_size = commsParams.bag_size
+
+    num_emb_tables_batched = (
+        num_tables_per_device
+        if collectiveArgs.num_emb_tables_batched == -1
+        else collectiveArgs.num_emb_tables_batched
+    )
+    collectiveArgs.num_emb_ops = num_tables_per_device // num_emb_tables_batched
+
+    collectiveArgs.emb = [
+        SplitTableBatchedEmbeddingBagsCodegen(
+            embedding_specs=[
+                (
+                    num_embeddings,
+                    collectiveArgs.emb_dim,
+                    EmbeddingLocation.DEVICE
+                    if commsParams.device == "cuda"
+                    else EmbeddingLocation.HOST,
+                    ComputeDevice.CUDA
+                    if commsParams.device == "cuda"
+                    else ComputeDevice.CPU,
+                )
+                for _ in range(num_emb_tables_batched)
+            ],
+            device=backendFuncs.get_device(),
+            optimizer=OptimType.EXACT_ROWWISE_ADAGRAD,
+        )
+        for _ in range(collectiveArgs.num_emb_ops)
+    ]
+
+    collectiveArgs.embRequests = generate_requests(
+        iters=collectiveArgs.num_emb_ops,
+        B=collectiveArgs.batch_size,
+        T=num_emb_tables_batched,
+        L=bag_size,
+        E=num_embeddings,
+    )

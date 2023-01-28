@@ -2,8 +2,10 @@
 This file contains test classes with default values for comms unit tests.
 Feel free to add additional classes or modify existing ones as needed for new tests.
 """
+from comms_utils import commsArgs
 
-class testArgs: # default args to run tests with
+
+class testArgs:  # default args to run tests with
     def __init__(self):
         self.trace_file = ""
         self.use_remote_trace = False
@@ -17,6 +19,8 @@ class testArgs: # default args to run tests with
         self.output_path = "/tmp/paramReplayedTrace"
         self.colls_per_batch = -1
         self.use_timestamp = False
+        self.rebalance_policy = ""
+
 
 class commsParamsTest:
     def __init__(self):
@@ -33,6 +37,7 @@ class commsParamsTest:
         self.dcheck = 1
         self.num_pgs = 1
 
+
 class comms_world_info_test:
     def __init__(self):
         self.global_rank = 0
@@ -42,3 +47,14 @@ class comms_world_info_test:
         self.master_ip = "localhost"
         self.master_port = "25555"
         self.num_tpu_cores = 16
+
+
+def createCommsArgs(**kwargs) -> commsArgs:
+    """
+    Test utility to create comms args from a dict of values.
+    """
+    curComm = commsArgs()
+    for key, value in kwargs.items():
+        setattr(curComm, key, value)
+
+    return curComm

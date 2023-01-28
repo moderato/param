@@ -29,20 +29,20 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-mkdir -p examples/pytorch/exgr_jsons
+mkdir -p examples/pytorch/my_eg_jsons
 python setup.py install
 
 # AlexNet
-rm examples/pytorch/exgr_jsons/alex_net.json
-python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 # -v
-python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 -p
-python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph "module::ZeroGrad"
-python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph "module::Forward"
-python -m param_bench.train.compute.python.pytorch.exgr_replay -m alex_net -w 10 -i 100 --subgraph "module::Backward_WeightsUpdate"
+rm examples/pytorch/my_eg_jsons/alex_net.json
+python -m param_bench.train.compute.python.pytorch.my_eg_replay -m alex_net -w 10 -i 100 # -v
+python -m param_bench.train.compute.python.pytorch.my_eg_replay -m alex_net -w 10 -i 100 -p
+python -m param_bench.train.compute.python.pytorch.my_eg_replay -m alex_net -w 10 -i 100 --subgraph "module::ZeroGrad"
+python -m param_bench.train.compute.python.pytorch.my_eg_replay -m alex_net -w 10 -i 100 --subgraph "module::Forward"
+python -m param_bench.train.compute.python.pytorch.my_eg_replay -m alex_net -w 10 -i 100 --subgraph "module::Backward_WeightsUpdate"
 
 # DLRM default (batch_size = 1024)
 # Ref time on V100: ~5.6 ms
 # Bottom MLP: 512-512-64
 # Top MLP: 1024-1024-1024-1
 # Embedding lookup: 1000000 rows * 8 tables, D = 64, L = 100
-python -m param_bench.train.compute.python.pytorch.exgr_replay -m dlrm_default_1024 -w 10 -i 100 -k "module::get_batch_data"
+python -m param_bench.train.compute.python.pytorch.my_eg_replay -m dlrm_default_1024 -w 10 -i 100 -k "module::get_batch_data"

@@ -12,18 +12,30 @@ import torch
 from torch.profiler import ExecutionGraphObserver
 from ..lib import pytorch as lib_pytorch
 from ..lib.init_helper import init_logging, load_modules
-from ..lib.pytorch.replay_utils import *
+from ..tools.eg_replay_utils import *
 from ..workloads import pytorch as workloads_pytorch
 from ..workloads.pytorch.alex_net import AlexNet
-
-# N.B. Exgr utils required. Integration to Pytorch WIP.
-from ..lib.pytorch.exec_graph_utils import ExecutionGraph
+from ..tools.execution_graph import ExecutionGraph
 
 
-class ExgrReplayManager:
-    def __init__(self, exgr, args):
-        with open(exgr, 'r') as f:
-            self.exgr = ExecutionGraph(json.load(f))
+def trace_handler(prof):
+    # print(prof.key_averages().table(
+    #     sort_by="self_cuda_time_total", row_limit=-1))
+    prof.export_chrome_trace("/tmp/test_trace_" + str(prof.step_num) + ".json")
+
+
+def another_trace_handler(text=""):
+    def handle_fn(prof):
+        # print(prof.key_averages().table(
+        #     sort_by="self_cuda_time_total", row_limit=-1))
+        prof.export_chrome_trace("/tmp/test_trace_replay_{}.json".format(text))
+    return handle_fn
+
+
+class egReplayManager:
+    def __init__(self, eg, args):
+        with open(eg, 'r') as f:
+            self.eg = ExecutionGraph(json.load(f))
         self.model_name = args.model
         self.numWarmupIters = args.warmup
         self.numIters = args.iteration
@@ -63,7 +75,7 @@ class ExgrReplayManager:
         """
             return: root node of the subgraph
         """
-        nodes = self.exgr.get_nodes(clean=True)
+        nodes = self.eg.get_nodes(clean=True)
         assert isinstance(self.root_node_name, str)
         if self.root_node_name != "":
             # Look up root nodes of subgraph by name
@@ -75,7 +87,7 @@ class ExgrReplayManager:
 
     def build_func(self, n):
         if is_fbgemm_forward(n):
-            func, output_count = build_fbgemm_func(n)
+            func, output_count = build_fbgemm_func(n, "cuda", 1000000) # TODO: get num of rows from node
             self.fbgemm_backward_ops.append(func.backward)
             return func.forward, output_count
         elif is_fbgemm_backward(n):
@@ -120,7 +132,7 @@ class ExgrReplayManager:
 
     def generate_tensor(self, n, instantiate: set):
         if is_fbgemm_forward(n):
-            input_args, _ = generate_fbgemm_tensors(n)
+            input_args, _ = generate_fbgemm_tensors(n, "cuda", 1000000, 100, 1.0) # TODO: get args from node
         for idx, (tp, t_id, shape) in enumerate(get_input_tensors(n)):
             if self.is_tensor_registered(t_id) and \
                     t_id not in self.tensor_registry_permanent.keys() and \
@@ -325,8 +337,8 @@ def main():
     # Load PyTorch operator workloads.
     load_modules(workloads_pytorch)
 
-    exgr_json_path = "examples/pytorch/exgr_jsons/{}.json".format(args.model)
-    if not os.path.exists(exgr_json_path):
+    eg_json_path = "examples/pytorch/my_eg_jsons/{}.json".format(args.model)
+    if not os.path.exists(eg_json_path):
         if args.model == "alex_net": # Default
             batch_size = 2
             an = AlexNet().cuda() # AlexNet
@@ -363,9 +375,9 @@ def main():
                 event_2.record()
                 torch.cuda.synchronize()
                 total_time += event_1.elapsed_time(event_2) # In ms
-            print("Time per iteration: {} ms".format(total_time / 100))
+            print("Time per iteration: {:.2f} ms".format(total_time / 100))
 
-            # Collect exgr
+            # Collect eg
             fp = tempfile.NamedTemporaryFile('w+t', suffix='.json', delete=False)
             fp.close()
             eg = ExecutionGraphObserver()
@@ -381,12 +393,12 @@ def main():
                 optimizer.step()
             eg.stop()
             eg.unregister_callback()
-            logger.info("Copy to exgr json to {}".format(exgr_json_path))
-            shutil.copy(fp.name, exgr_json_path)
+            logger.info("Copy to eg json to {}".format(eg_json_path))
+            shutil.copy(fp.name, eg_json_path)
         else:
             sys.error("Execution graph json file doesn't exist! Quit replay...")
 
-    replay_manager = ExgrReplayManager(exgr_json_path, args)
+    replay_manager = egReplayManager(eg_json_path, args)
     replay_manager.benchTime()
 
 if __name__ == "__main__":

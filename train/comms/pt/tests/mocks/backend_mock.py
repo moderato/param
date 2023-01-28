@@ -1,6 +1,7 @@
 import torch
 
-class MockBackendFunction: # Mock backend function
+
+class MockBackendFunction:  # Mock backend function
     # TODO: Add configurable options.
     def __init__(self):
         self.collectiveFunc = {
@@ -30,34 +31,38 @@ class MockBackendFunction: # Mock backend function
 
     # Collectives
     def all_gather(self, collectiveArgs, retFlag=False):
-        pass
+        self.mock_collective(collectiveArgs)
 
     def all_reduce(self, collectiveArgs, retFlag=False):
-        pass
+        self.mock_collective(collectiveArgs)
 
     def broadcast(self, collectiveArgs, retFlag=False):
-        pass
+        self.mock_collective(collectiveArgs)
 
     def reduce(self, collectiveArgs, retFlag=False):
-        pass
+        self.mock_collective(collectiveArgs)
 
     def all_to_all(self, collectiveArgs, retFlag=False):
-        pass
+        self.mock_collective(collectiveArgs)
 
     def all_to_allv(self, collectiveArgs, retFlag=False):
-        pass
+        self.mock_collective(collectiveArgs)
 
     def recv(self, collectiveArgs, retFlag=False):
-        pass
+        self.mock_collective(collectiveArgs)
 
     def complete_accel_ops(self, collectiveArgs, devSync=False):
-        pass
+        self.mock_collective(collectiveArgs)
 
     def barrier(self, collectiveArgs, name="dummy"):
-        pass
+        self.mock_collective(collectiveArgs)
 
     def sync_barrier(self, collectiveArgs, desc="world"):
         self.barrier(collectiveArgs, name=desc)
+
+    def mock_collective(self, collectiveArgs):
+        # Mock this function to change collectiveArgs values.
+        return collectiveArgs
 
     def get_reduce_op(self, opName):
         pass
@@ -123,4 +128,6 @@ class MockBackendFunction: # Mock backend function
     def alloc_random(
         self, sizeArr, curRankDevice="cpu", dtype=torch.int32, scaleFactor=1.0
     ):
-        return self.alloc_ones(sizeArr, "cpu", dtype, 1.0) # just return arrays of 1 for testing
+        return self.alloc_ones(
+            sizeArr, "cpu", dtype, 1.0
+        )  # just return arrays of 1 for testing

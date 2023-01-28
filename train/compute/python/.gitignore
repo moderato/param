@@ -5,4 +5,4 @@
 /*.json
 /*.log
 __pycache__
-examples/pytorch/exgr_jsons
+examples/pytorch/my_eg_jsons
