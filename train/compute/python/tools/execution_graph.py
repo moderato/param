@@ -10,6 +10,7 @@ import argparse
 import json
 import logging
 import sys
+from collections import defaultdict
 from enum import Enum
 from typing import Any, Iterable, List, Set, TextIO
 
@@ -213,6 +214,8 @@ class Node:
         return None
 
     def get_child_by_name(self, names) -> Node:
+        if isinstance(names, str):
+            names = [names]
         for name in names:
             node = self._get_child_by_name(name)
             if node is not None:
@@ -229,6 +232,8 @@ class Node:
         return None
 
     def get_parent_by_name(self, names) -> Node:
+        if isinstance(names, str):
+            names = [names]
         for name in names:
             node = self._get_parent_by_name(name)
             if node is not None:
@@ -275,10 +280,12 @@ class ExecutionGraph:
         self.proc_group = {}
         pid = json["pid"]
         self.proc_group = {pid: {}}
+        self.name_id_map = defaultdict(set)
         nodes_list = json["nodes"]
         for x in nodes_list:
             id = x["id"]
             tid = x["tid"]
+            self.name_id_map[x["name"]].add(id)
             self.nodes[id] = Node(
                 x["name"],
                 id,
@@ -336,10 +343,16 @@ class ExecutionGraph:
         # remove all dataloader ops
         self.remove_dataloader_ops()
 
-    def get_nodes(self, clean: bool = False):
-        if clean:
-            return self.clean_nodes
-        return self.nodes
+    def get_nodes(self, clean: bool = False, to_be_pruned=None):
+        nodes = self.clean_nodes if clean else self.nodes
+        if to_be_pruned is not None:
+            assert isinstance(to_be_pruned, Node) or isinstance(to_be_pruned, list)
+            if not isinstance(to_be_pruned, list):
+                to_be_pruned = [to_be_pruned]
+            for op_name in to_be_pruned:
+                for node_id in self.name_id_map[op_name]:
+                    nodes = self.prune_subgraph(nodes, self.nodes[node_id])
+        return nodes
 
     def get_unique_ops(
         self, detail: bool = False, clean: bool = False, json_format: bool = False
@@ -392,6 +405,18 @@ class ExecutionGraph:
             attr["inputs"] = list(map(json.loads, unique))
 
         return ops
+
+    def prune_subgraph(self, nodes: dict, root: Node):
+        to_be_deleted = set()
+        def dfs(root):
+            nonlocal to_be_deleted
+            to_be_deleted.add(root.id)
+            for c in root.children:
+                dfs(c)
+        dfs(root)
+        for k in to_be_deleted:
+            del nodes[k]
+        return nodes
 
     def print_op_stats(
         self, detail: bool = False, clean: bool = False, json_format: bool = False
