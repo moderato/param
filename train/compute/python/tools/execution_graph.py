@@ -344,7 +344,7 @@ class ExecutionGraph:
         self.remove_dataloader_ops()
 
     def get_nodes(self, clean: bool = False, to_be_pruned=None):
-        nodes = self.clean_nodes if clean else self.nodes
+        nodes = self.clean_nodes.copy() if clean else self.nodes.copy()
         if to_be_pruned is not None:
             assert isinstance(to_be_pruned, Node) or isinstance(to_be_pruned, list)
             if not isinstance(to_be_pruned, list):

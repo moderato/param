@@ -214,10 +214,11 @@ class PyTorchDistBackend(backendFunctions):
             for r in work:
                 r.wait()
         else:
-            if collectiveArgs.num_emb_tables_batched != -1:
-                logger.warn(
-                    "Not using batched embedding tables because extend distributed package not in use"
-                )
+            # Temporarily suppress this warning.
+            # if collectiveArgs.num_emb_tables_batched != -1:
+            #     logger.warn(
+            #         "Not using batched embedding tables because extend distributed package not in use"
+            #     )
 
             work = dist.all_to_all(
                 collectiveArgs.opTensor if not pair else collectiveArgs.opTensor_pair,
