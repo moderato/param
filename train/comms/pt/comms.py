@@ -464,7 +464,8 @@ class commsCollBench(paramCommsBench):
                 comm_fn(self.collectiveArgs)
                 # post another collecitve if on comms pair mode, otherwise it's noop
                 self.collectiveArgs.group = self.backendFuncs.get_next_group()
-                comm_fn_pair(self.collectiveArgs, pair=enable_comms_pair)
+                if enable_comms_pair:
+                    comm_fn_pair(self.collectiveArgs, pair=enable_comms_pair)
 
             if enable_compute:
                 with paramStreamGuard(
@@ -1639,7 +1640,8 @@ def main():
             comms_utils.gracefulExit()
 
         commsParams = comms_utils.commsParamsHolder(
-            args, comms_world_info, element_size, collBenchObj.benchTime
+            args, comms_world_info, element_size,
+            collBenchObj.benchTime if args.bench_params_file is None else collBenchObj.benchTimeWithFile
         )
 
         if args.pair and args.overlap_pair_pgs:

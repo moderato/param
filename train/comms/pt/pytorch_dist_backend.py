@@ -393,7 +393,7 @@ class PyTorchDistBackend(backendFunctions):
             return retObj
 
     def all_gather_base(self, collectiveArgs, retFlag=False, pair=False):
-        retObj = dist.all_gather_into_tensor(
+        retObj = dist._all_gather_base( # Outdated in latest PyTorch. TODO: Update it.
             output_tensor=collectiveArgs.opTensor,
             input_tensor=collectiveArgs.ipTensor,
             group=self.get_collective_group(collectiveArgs),

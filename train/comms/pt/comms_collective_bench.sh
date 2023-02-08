@@ -11,5 +11,5 @@ done
 # Benchmark with params from a file
 mpirun -np ${num_gpus} --hostfile ./hfile.txt ./comms.py \
         --master-ip $(head -n 1 ./hfile.txt) --n 100 --w 20 --z 1 --log INFO \
-        --bench-params-file $PM_HOME/bench_params/a2a_4_params.txt \
+        --bench-params-file ${PM_HOME}/bench_params/a2a_${num_gpus}_params.txt \
         --collective "all_to_allv" --backend nccl --device cuda > ./bench_results/general_all_to_allv_${num_gpus}.txt
