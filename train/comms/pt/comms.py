@@ -1547,6 +1547,8 @@ class commsCollBench(paramCommsBench):
                     self.collectiveArgs, commsParams, resultList
                 )
 
+                # Current bug: processes are not killed after a keyboard interrupt; need to manually kill them.
+                # TODO: Fix this.
                 if global_rank == 0:
                     runtime = '-'.join([str('{:.4f}'.format(t[0].item())) for t in tensorList])
                     dimensions = str(B) + ',' + '-'.join([str(int(t[1].item())) for t in tensorList]) + ',' + str(D)
