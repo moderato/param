@@ -173,7 +173,7 @@ def getSizes(
     allSizes = []
     while curSize <= endSize:
         allSizes.append(curSize)
-        curSize = curSize * stepFactor if stepBytes == 0 else curSize + stepBytes
+        curSize = int(curSize * stepFactor) if stepBytes == 0 else curSize + stepBytes
         numIters = numIters + 1
         if numIters > 100:
             logger.error(

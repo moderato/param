@@ -91,7 +91,7 @@ class commsCollBench(paramCommsBench):
             help="maximum size, in bytes, to end at",
         )  # COMMS mode, end the sweep at.
         parser.add_argument(
-            "--f", type=int, default=2, help="multiplication factor between sizes"
+            "--f", type=float, default=2.0, help="multiplication factor between sizes"
         )  # COMMS mode, multiplication factor.
         parser.add_argument(
             "--sb",
@@ -815,6 +815,7 @@ class commsCollBench(paramCommsBench):
                 commsParams.stepFactor,
                 commsParams.stepBytes,
             )  # Given the begin-size, end-size, step-factor what are the message sizes to iterate on.
+            allSizes = [(x // commsParams.element_size * commsParams.element_size) for x in allSizes]
 
         self.collectiveArgs.group = group
         self.collectiveArgs.groups = groups
