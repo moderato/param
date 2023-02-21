@@ -39,6 +39,7 @@ LABEL_MARKERS = [
     "forward",
     "backward",
     "Optimizer.zero_grad",
+    "Optimizer.step",
     "[param",
     "<forward op>",
     "reduce-grads",
