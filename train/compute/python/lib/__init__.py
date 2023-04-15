@@ -5,7 +5,7 @@ __base_version__ = "1.0.0"
 
 def __generate_git_param_train_compute_version():
     # git hash
-    commit_version = "-git"
+    commit_version = "+git"
     try:
         import git
 
